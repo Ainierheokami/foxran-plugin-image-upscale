@@ -1,0 +1,54 @@
+# 图片放大插件配置。
+# 指定 models.yaml 里的图像编辑模型名（推荐 gpt-image-2）；留空则按 image_edit 标签轮询可用模型。
+model_name: ""
+
+# 未指定倍率时的放大倍率。
+default_scale: 2.0
+
+# 允许的最大放大倍率。
+max_scale: 4.0
+
+# 候选切块（输出）尺寸，即每块交给模型重绘的画布大小。按块数最少优先挑一个。
+tile_sizes:
+  - 1024x1024
+  - 1536x1024
+  - 1024x1536
+
+# 相邻切块的冗余比例（相对切块短边），冗余区用于对齐和找拼缝。范围 0.02~0.45。
+overlap_ratio: 0.15
+
+# 单张图最多切多少块（每块一次模型调用）；超出时自动降低倍率。
+max_tiles: 16
+
+# 输出总像素上限；超出时自动降低倍率。
+max_output_pixels: 40000000
+
+# 同时请求模型的切块数。
+max_concurrency: 3
+
+# 单块失败后的重试次数。
+retries: 1
+
+# 是否把模型重绘的切块对齐回原图位置（修正模型带来的轻微平移/缩放）。
+align: true
+
+# 低频校色强度 0~1，用于消除各块之间的色差；0 关闭。
+color_correction: 0.8
+
+# 拼缝羽化半径（像素）。
+seam_feather: 6.0
+
+# 某块重试仍失败时用普通插值顶上（结果里会注明），关闭则整张失败。
+fallback_on_failure: true
+
+# 附加在每块提示词末尾的自定义要求。
+prompt: ""
+
+# 输出格式：png / jpg / webp。
+output_format: png
+
+# jpg / webp 质量。
+jpeg_quality: 95
+
+# PNG 超过此大小（MB）时改存为 jpg；0 不限制。
+max_output_mb: 20
