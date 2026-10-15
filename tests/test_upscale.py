@@ -147,3 +147,60 @@ def test_alpha_is_preserved():
     result = asyncio.run(upscale_mod.upscale(src, scale=2.0, cfg=cfg, redraw=_fake_model(1)))
     assert result.image.mode == "RGBA"
     assert abs(np.asarray(result.image)[..., 3].mean() - 128) < 2
+
+
+def _moving_model(shift_block: bool):
+    """Large global drift (8% shift, 6% zoom); optionally moves a block of content."""
+    async def redraw(prompt: str, data: bytes, size: str) -> bytes:
+        w, h = tiling.parse_size(size)
+        with Image.open(BytesIO(data)) as im:
+            arr = np.asarray(im.convert("RGB"), np.float32)
+        m = np.float32([[1.06, 0, 0.08 * w], [0, 0.95, -0.05 * h]])
+        arr = cv2.warpAffine(arr, m, (w, h), borderMode=cv2.BORDER_REFLECT)
+        if shift_block:
+            # The model "re-lays out" a band: content moves down by 15% of the tile.
+            y0, y1, dy = int(h * 0.4), int(h * 0.7), int(h * 0.15)
+            arr[y0 + dy:y1 + dy] = arr[y0:y1].copy()
+        out = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+        buf = BytesIO()
+        out.save(buf, format="PNG")
+        return buf.getvalue()
+
+    return redraw
+
+
+def test_large_drift_is_registered():
+    src = _poster()
+    cfg = UpscaleConfig(tile_sizes=["1024x1024"], retries=0)
+    result = asyncio.run(upscale_mod.upscale(src, scale=2.0, cfg=cfg, redraw=_moving_model(False)))
+    out = np.asarray(result.image, np.float32)
+    ref = np.asarray(src.resize(result.image.size, Image.LANCZOS), np.float32)
+    assert not result.unaligned_tiles
+    assert np.abs(out - ref).mean() < 8.0
+
+
+def test_moved_content_is_patched_from_the_original():
+    src = _poster()
+    cfg = UpscaleConfig(tile_sizes=["1024x1024"], retries=0)
+    result = asyncio.run(upscale_mod.upscale(src, scale=2.0, cfg=cfg, redraw=_moving_model(True)))
+    assert result.patched_tiles
+    # Judged at source resolution, the layout matches the original again.
+    down = np.asarray(result.image.resize(src.size, Image.LANCZOS), np.float32)
+    err = np.abs(cv2.GaussianBlur(down, (0, 0), 1) - cv2.GaussianBlur(np.asarray(src, np.float32), (0, 0), 1)).mean(axis=2)
+    assert (err > 25).mean() < 0.02
+
+
+def test_unregistrable_tile_falls_back_to_the_original():
+    async def noise(prompt, data, size):
+        w, h = tiling.parse_size(size)
+        arr = np.random.default_rng(3).integers(0, 255, (h, w, 3), dtype=np.uint8)
+        buf = BytesIO()
+        Image.fromarray(arr).save(buf, format="PNG")
+        return buf.getvalue()
+
+    src = _poster(500, 400)
+    cfg = UpscaleConfig(tile_sizes=["1024x1024"], retries=0)
+    result = asyncio.run(upscale_mod.upscale(src, scale=2.0, cfg=cfg, redraw=noise))
+    ref = np.asarray(src.resize(result.image.size, Image.LANCZOS), np.float32)
+    assert result.unaligned_tiles
+    assert np.abs(np.asarray(result.image, np.float32) - ref).mean() < 4.0

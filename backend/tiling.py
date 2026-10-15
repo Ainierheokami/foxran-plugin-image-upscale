@@ -5,11 +5,13 @@ the host. Coordinates in a :class:`TilePlan` are in *output* pixels; the model
 receives the matching source region pre-resized to the tile's request size, so
 each tile is "redraw this canvas sharper" rather than "invent a bigger image".
 
-Pipeline per tile: model output -> resize to the tile box -> align to the
-interpolated reference (small affine) -> low-frequency colour correction.
-Neighbouring tiles are then joined along a minimum-difference seam inside
-their overlap, so text that two tiles redrew slightly differently is cut
-around instead of cross-faded into a ghost.
+Pipeline per tile: model output -> resize to the tile box -> register to the
+interpolated reference (SIFT/ECC affine, then smoothed optical flow) ->
+low-frequency colour correction -> regions whose layout still deviates fall
+back to the reference. Neighbouring tiles are joined along a
+minimum-difference seam inside their overlap, so text that two tiles redrew
+slightly differently is cut around instead of cross-faded into a ghost; the
+stitched image is finally anchored to the source's colours.
 """
 
 from __future__ import annotations
@@ -168,57 +170,170 @@ def to_image(array: np.ndarray) -> Image.Image:
     return Image.fromarray(np.clip(np.rint(array), 0, 255).astype(np.uint8), "RGB")
 
 
+def _small_size(h: int, w: int, limit: int) -> Tuple[float, Tuple[int, int]]:
+    factor = min(1.0, limit / max(h, w))
+    return factor, (max(8, round(w * factor)), max(8, round(h * factor)))
+
+
+def _gray_u8(arr: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
+    gray = cv2.cvtColor(np.clip(arr, 0, 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+    return cv2.resize(gray, size, interpolation=cv2.INTER_AREA)
+
+
+def _plausible(warp: np.ndarray, w: int, h: int, max_shift_ratio: float, max_zoom_dev: float) -> bool:
+    linear = warp[:, :2].astype(np.float64)
+    singular = np.linalg.svd(linear, compute_uv=False)
+    if singular.min() < 1 - max_zoom_dev or singular.max() > 1 + max_zoom_dev:
+        return False
+    # Where the tile centre lands tells the shift independent of zoom.
+    centre = np.array([w / 2, h / 2])
+    moved = linear @ centre + warp[:, 2] - centre
+    return abs(moved[0]) <= w * max_shift_ratio and abs(moved[1]) <= h * max_shift_ratio
+
+
+def _feature_warp(ref_g: np.ndarray, tile_g: np.ndarray) -> Optional[np.ndarray]:
+    """Affine ref->tile from SIFT matches; robust to large shifts and zoom."""
+    try:
+        sift = cv2.SIFT_create(nfeatures=4000)
+    except (AttributeError, cv2.error):
+        return None
+    kp_r, des_r = sift.detectAndCompute(ref_g, None)
+    kp_t, des_t = sift.detectAndCompute(tile_g, None)
+    if des_r is None or des_t is None or len(kp_r) < 8 or len(kp_t) < 8:
+        return None
+    pairs = cv2.BFMatcher(cv2.NORM_L2).knnMatch(des_r, des_t, k=2)
+    good = [m for m, *rest in pairs if rest and m.distance < 0.75 * rest[0].distance]
+    if len(good) < 12:
+        return None
+    src = np.float32([kp_r[m.queryIdx].pt for m in good])
+    dst = np.float32([kp_t[m.trainIdx].pt for m in good])
+    warp, inliers = cv2.estimateAffine2D(src, dst, method=cv2.RANSAC, ransacReprojThreshold=3.0, maxIters=4000)
+    if warp is None or inliers is None or int(inliers.sum()) < 10:
+        return None
+    return warp.astype(np.float32)
+
+
+def _ecc_warp(ref_g: np.ndarray, tile_g: np.ndarray, init: np.ndarray) -> Optional[np.ndarray]:
+    blur = lambda g: cv2.GaussianBlur(g.astype(np.float32) / 255.0, (0, 0), 1.5)
+    warp = init.astype(np.float32).copy()
+    try:
+        _, warp = cv2.findTransformECC(
+            blur(ref_g), blur(tile_g), warp, cv2.MOTION_AFFINE,
+            (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 100, 1e-5), None, 5,
+        )
+    except cv2.error:
+        return None
+    return warp
+
+
+def _local_flow(aligned: np.ndarray, reference: np.ndarray, max_ratio: float) -> np.ndarray:
+    """Correct smooth local drift (elements nudged by a few pixels) with optical flow.
+
+    The flow is blurred heavily so it moves whole elements back, never
+    individual strokes: redrawn text keeps its new, correct shape.
+    """
+    h, w = reference.shape[:2]
+    factor, small = _small_size(h, w, 768)
+    ref_g = _gray_u8(reference, small)
+    tile_g = _gray_u8(aligned, small)
+    dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
+    flow = dis.calc(ref_g, tile_g, None)
+    sigma = max(small) / 40
+    flow = cv2.GaussianBlur(flow, (0, 0), sigma)
+    limit = max_ratio * max(small)
+    magnitude = np.linalg.norm(flow, axis=2, keepdims=True)
+    flow = flow * np.minimum(1.0, limit / (magnitude + 1e-6))
+    flow = cv2.resize(flow, (w, h), interpolation=cv2.INTER_LINEAR) / factor
+    gx, gy = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+    return cv2.remap(aligned, gx + flow[..., 0], gy + flow[..., 1], cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
+
+
 def align_to_reference(
     tile: np.ndarray,
     reference: np.ndarray,
     *,
-    max_shift_ratio: float = 0.05,
-    max_scale_dev: float = 0.06,
+    max_shift_ratio: float = 0.2,
+    max_zoom_dev: float = 0.2,
+    local: bool = True,
 ) -> Tuple[np.ndarray, bool]:
-    """Undo the small shift/zoom image models add when redrawing a tile.
+    """Undo the shift, zoom and local drift image models add when redrawing a tile.
 
-    Estimates an affine warp on blurred, downscaled greyscale copies with ECC
-    and applies it only if it stays close to identity; anything larger means
-    the model changed the content, and warping would make it worse. Returns
-    ``(tile, ok)``; ``ok`` is False when a textured tile could not be aligned.
+    A global affine comes from SIFT matches (refined by ECC), falling back to
+    ECC alone on tiles without features; optical flow then corrects smooth
+    local drift. Returns ``(tile, ok)``; ``ok`` is False when a textured tile
+    could not be registered, and the tile comes back unwarped.
     """
     h, w = reference.shape[:2]
-    factor = min(1.0, 640 / max(h, w))
-    small = (max(8, round(w * factor)), max(8, round(h * factor)))
-
-    def prep(arr: np.ndarray) -> np.ndarray:
-        gray = cv2.cvtColor(arr.astype(np.float32), cv2.COLOR_RGB2GRAY)
-        gray = cv2.resize(gray, small, interpolation=cv2.INTER_AREA)
-        return cv2.GaussianBlur(gray, (0, 0), 1.5) / 255.0
-
-    ref_small = prep(reference)
+    factor, small = _small_size(h, w, 1024)
+    ref_g = _gray_u8(reference, small)
     # Nearly blank tiles have nothing to lock onto, and nothing to misplace.
-    if float(ref_small.std()) < 0.02:
+    if float(ref_g.std()) < 5.0:
         return tile, True
-    warp = np.eye(2, 3, dtype=np.float32)
-    try:
-        _, warp = cv2.findTransformECC(
-            ref_small, prep(tile), warp, cv2.MOTION_AFFINE,
-            (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 80, 1e-5), None, 5,
-        )
-    except cv2.error:
+    tile_g = _gray_u8(tile, small)
+
+    sw, sh = small
+    warp = _feature_warp(ref_g, tile_g)
+    if warp is not None and _plausible(warp, sw, sh, max_shift_ratio, max_zoom_dev):
+        refined = _ecc_warp(ref_g, tile_g, warp)
+        if refined is not None and _plausible(refined, sw, sh, max_shift_ratio, max_zoom_dev):
+            warp = refined
+    else:
+        warp = _ecc_warp(ref_g, tile_g, np.eye(2, 3, dtype=np.float32))
+    if warp is None or not _plausible(warp, sw, sh, max_shift_ratio, max_zoom_dev):
         return tile, False
 
-    linear = warp[:, :2]
-    shift = warp[:, 2] / factor
-    if (
-        np.abs(linear - np.eye(2)).max() > max_scale_dev
-        or abs(shift[0]) > w * max_shift_ratio
-        or abs(shift[1]) > h * max_shift_ratio
-    ):
-        return tile, False
-    full = np.hstack([linear, shift.reshape(2, 1)]).astype(np.float32)
+    full = warp.copy()
+    full[:, 2] /= factor
     aligned = cv2.warpAffine(
         tile, full, (w, h),
         flags=cv2.INTER_CUBIC | cv2.WARP_INVERSE_MAP,
         borderMode=cv2.BORDER_REFLECT,
     )
+    if local:
+        aligned = _local_flow(aligned, reference, max_ratio=0.03)
     return aligned, True
+
+
+def deviation_mask(tile: np.ndarray, reference: np.ndarray, scale: float, threshold: float) -> Tuple[np.ndarray, float]:
+    """Where the redrawn tile no longer matches the layout of the original.
+
+    Both are blurred to a few source pixels, so sharper edges and corrected
+    glyphs barely register while moved, missing or invented elements do.
+    Returns a feathered weight for the reference (1 = use the reference) and
+    the share of the tile that deviates.
+    """
+    sigma = max(1.5, 3.0 * scale)
+    diff = np.abs(cv2.GaussianBlur(tile, (0, 0), sigma) - cv2.GaussianBlur(reference, (0, 0), sigma)).mean(axis=2)
+    bad = (diff > threshold).astype(np.uint8)
+    size = max(3, int(round(2 * scale)) | 1)
+    bad = cv2.morphologyEx(bad, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size)))
+    ratio = float(bad.mean())
+    if not ratio:
+        return np.zeros(diff.shape, np.float32), 0.0
+    grow = max(3, int(round(6 * scale)) | 1)
+    mask = cv2.dilate(bad, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (grow, grow))).astype(np.float32)
+    mask = cv2.GaussianBlur(mask, (0, 0), max(1.0, 2.0 * scale))
+    return np.clip(mask * 1.5, 0, 1), ratio
+
+
+def anchor_to_source(output: np.ndarray, source: np.ndarray, strength: float, iterations: int = 2) -> np.ndarray:
+    """Make the result agree with the original once scaled back down.
+
+    Back-projects the smoothed difference between the source and the
+    downscaled result. Only broad colour and brightness move (smoothing keeps
+    redrawn strokes), which removes tile-to-tile colour steps, including on
+    flat backgrounds where seams have nothing else to hide behind.
+    """
+    if strength <= 0:
+        return output
+    sh, sw = source.shape[:2]
+    oh, ow = output.shape[:2]
+    result = output.astype(np.float32)
+    for _ in range(max(1, iterations)):
+        down = cv2.resize(result, (sw, sh), interpolation=cv2.INTER_AREA)
+        residual = cv2.GaussianBlur(source - down, (0, 0), 1.0)
+        result = result + cv2.resize(residual, (ow, oh), interpolation=cv2.INTER_CUBIC) * float(min(strength, 1.0))
+    return result
 
 
 def match_low_frequency(tile: np.ndarray, reference: np.ndarray, strength: float) -> np.ndarray:
@@ -237,7 +352,7 @@ def match_low_frequency(tile: np.ndarray, reference: np.ndarray, strength: float
 # ---------------------------------------------------------------- stitching
 
 
-def _seam_mask(a: np.ndarray, b: np.ndarray, feather: float) -> np.ndarray:
+def _seam_mask(a: np.ndarray, b: np.ndarray, feather: float, ref: Optional[np.ndarray] = None) -> np.ndarray:
     """Weights for ``b`` over a left/right overlap (``a`` left, ``b`` right).
 
     Finds the top-to-bottom path where the two tiles agree most (dynamic
@@ -248,6 +363,9 @@ def _seam_mask(a: np.ndarray, b: np.ndarray, feather: float) -> np.ndarray:
     if ov <= 2:
         return np.ones((h, ov), np.float32) * (np.arange(ov) >= ov / 2)
     diff = np.abs(a - b).sum(axis=2)
+    if ref is not None:
+        # Prefer cutting where both tiles also agree with the original layout.
+        diff += 0.5 * (np.abs(a - ref).sum(axis=2) + np.abs(b - ref).sum(axis=2))
     diff = cv2.blur(diff, (5, 5))
     margin = min(ov // 2 - 1, max(2, int(math.ceil(feather * 2))))
     if margin > 0:
@@ -278,7 +396,9 @@ def _seam_mask(a: np.ndarray, b: np.ndarray, feather: float) -> np.ndarray:
     return mask
 
 
-def _stitch_horizontal(parts: Sequence[np.ndarray], xs: Sequence[int], width: int, feather: float) -> np.ndarray:
+def _stitch_horizontal(
+    parts: Sequence[np.ndarray], xs: Sequence[int], width: int, feather: float, ref: Optional[np.ndarray] = None,
+) -> np.ndarray:
     h = parts[0].shape[0]
     canvas = np.zeros((h, width, parts[0].shape[2]), np.float32)
     end = 0
@@ -286,24 +406,36 @@ def _stitch_horizontal(parts: Sequence[np.ndarray], xs: Sequence[int], width: in
         pw = part.shape[1]
         ov = max(0, end - x)
         if ov:
-            mask = _seam_mask(canvas[:, x:end], part[:, :ov], feather)[..., None]
+            ref_ov = ref[:, x:end] if ref is not None else None
+            mask = _seam_mask(canvas[:, x:end], part[:, :ov], feather, ref_ov)[..., None]
             canvas[:, x:end] = canvas[:, x:end] * (1 - mask) + part[:, :ov] * mask
         canvas[:, x + ov:x + pw] = part[:, ov:]
         end = x + pw
     return canvas
 
 
-def stitch(plan: TilePlan, tiles: Sequence[np.ndarray], feather: float = 6.0) -> np.ndarray:
-    """Join tiles (in ``plan.tiles`` order) into the full output image."""
+def stitch(
+    plan: TilePlan, tiles: Sequence[np.ndarray], feather: float = 6.0, reference: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Join tiles (in ``plan.tiles`` order) into the full output image.
+
+    With ``reference`` (the interpolated original) seams avoid places where a
+    tile departs from the original layout.
+    """
     by_pos = {(t.row, t.col): arr for t, arr in zip(plan.tiles, tiles)}
     xs = sorted({t.x for t in plan.tiles})
     ys = sorted({t.y for t in plan.tiles})
+    row_ys = {t.row: t.y for t in plan.tiles}
     strips = [
-        _stitch_horizontal([by_pos[(r, c)] for c in range(plan.cols)], xs, plan.out_w, feather)
+        _stitch_horizontal(
+            [by_pos[(r, c)] for c in range(plan.cols)], xs, plan.out_w, feather,
+            reference[row_ys[r]:row_ys[r] + plan.tile_h] if reference is not None else None,
+        )
         for r in range(plan.rows)
     ]
     # Rows are joined the same way on transposed strips.
     joined = _stitch_horizontal(
-        [s.transpose(1, 0, 2) for s in strips], ys, plan.out_h, feather
+        [s.transpose(1, 0, 2) for s in strips], ys, plan.out_h, feather,
+        reference.transpose(1, 0, 2) if reference is not None else None,
     )
     return joined.transpose(1, 0, 2)

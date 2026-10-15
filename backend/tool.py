@@ -130,7 +130,11 @@ def describe(result: UpscaleResult, src_size: tuple[int, int], seconds: float) -
     if result.failed_tiles:
         lines.append(f"第 {', '.join(result.failed_tiles)} 块重绘失败，用普通插值代替。")
     if result.unaligned_tiles:
-        lines.append(f"第 {', '.join(result.unaligned_tiles)} 块与原图偏差较大，未做对齐，拼缝处请留意。")
+        lines.append(f"第 {', '.join(result.unaligned_tiles)} 块重绘后无法和原图对齐，这几块用的是普通插值。")
+    heavy = {k: v for k, v in result.patched_tiles.items() if k not in result.unaligned_tiles and v >= 0.05}
+    if heavy:
+        parts = "，".join(f"{k}（{v:.0%}）" for k, v in heavy.items())
+        lines.append(f"模型重绘时挪动或改动了部分内容，这些区域已用原图插值填补：{parts}。")
     return "\n".join(lines)
 
 
@@ -189,6 +193,7 @@ class ImageHDUpscaleTool(BaseTool):
                 redraw=_make_redraw(cfg),
                 text_hint=args.text_hint.strip(),
                 progress=progress,
+                debug_dir=OUTPUT_DIR / "debug" / time.strftime("%Y%m%d-%H%M%S") if cfg.save_tiles else None,
             )
         except Exception as e:
             logger.error(f"[图片放大] 处理失败: {e}", exc_info=True)

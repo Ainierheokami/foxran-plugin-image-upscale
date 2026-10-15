@@ -3,7 +3,7 @@ manifest_version: 1
 extension:
   id: "image_hd_upscale"
   name: "图片放大"
-  version: "1.1.0"
+  version: "1.2.0"
   type: "tool"
   description: "把图片按甜点尺寸带冗余切块，交给 GPT Image 2 等图像编辑模型逐块高清重绘（顺带修复乱码文字），再对齐、校色并沿最佳拼缝拼回高分辨率原图。"
   author: "Ainierheokami"

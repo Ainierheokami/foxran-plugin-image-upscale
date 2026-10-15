@@ -10,6 +10,7 @@ import asyncio
 import math
 from dataclasses import dataclass, field
 from io import BytesIO
+from pathlib import Path
 from typing import Awaitable, Callable, List, Optional
 
 import numpy as np
@@ -22,6 +23,8 @@ from .tiling import (
     Tile,
     TilePlan,
     align_to_reference,
+    anchor_to_source,
+    deviation_mask,
     match_low_frequency,
     plan_tiles,
     stitch,
@@ -52,6 +55,8 @@ class UpscaleResult:
     scale_reduced: bool = False
     failed_tiles: List[str] = field(default_factory=list)
     unaligned_tiles: List[str] = field(default_factory=list)
+    patched_tiles: dict = field(default_factory=dict)
+    """Tile label -> share of the tile restored from the interpolated original."""
 
 
 def _where(plan: TilePlan, tile: Tile) -> str:
@@ -102,6 +107,7 @@ async def upscale(
     redraw: Redraw,
     text_hint: str = "",
     progress: Optional[Progress] = None,
+    debug_dir: Optional[Path] = None,
 ) -> UpscaleResult:
     async def report(percent: int, message: str) -> None:
         if progress:
@@ -117,12 +123,17 @@ async def upscale(
     reference = src.resize((plan.out_w, plan.out_h), Image.LANCZOS)
     ref_arr = to_array(reference)
     total = len(plan.tiles)
+    if debug_dir is not None:
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        reference.save(debug_dir / "reference.png")
     await report(5, f"{src.width}x{src.height} → {plan.out_w}x{plan.out_h}，切成 {plan.rows}×{plan.cols} 块")
 
     semaphore = asyncio.Semaphore(max(1, cfg.max_concurrency))
     done = 0
     failed: List[str] = []
     unaligned: List[str] = []
+    patched: dict = {}
+    scale_factor = (plan.scale_x + plan.scale_y) / 2
 
     async def run(tile: Tile) -> np.ndarray:
         nonlocal done
@@ -136,7 +147,7 @@ async def upscale(
         payload = _png(source)
         prompt = build_prompt(plan, tile, text_hint, cfg.prompt)
 
-        result: Optional[np.ndarray] = None
+        best: Optional[TileCandidate] = None
         last_error: Optional[Exception] = None
         async with semaphore:
             for attempt in range(max(0, cfg.retries) + 1):
@@ -146,26 +157,42 @@ async def upscale(
                         out = out.convert("RGB")
                         if out.size != (tile.w, tile.h):
                             out = out.resize((tile.w, tile.h), Image.LANCZOS)
-                        result = to_array(out)
-                    break
+                        raw = to_array(out)
                 except Exception as e:
                     last_error = e
                     logger.warning(f"[图片放大] 切块 {label} 第 {attempt + 1} 次重绘失败: {e}")
+                    continue
+                candidate = await asyncio.to_thread(_postprocess, raw, ref_tile, cfg, scale_factor)
+                if debug_dir is not None:
+                    await asyncio.to_thread(_save_debug, debug_dir, f"{label}_try{attempt + 1}", raw, candidate)
+                if best is None or candidate.score < best.score:
+                    best = candidate
+                if candidate.aligned and candidate.deviation <= cfg.max_deviation:
+                    break
+                logger.info(
+                    f"[图片放大] 切块 {label} 第 {attempt + 1} 次重绘与原图偏差 {candidate.deviation:.0%}"
+                    f"{'' if candidate.aligned else '，无法对齐'}"
+                )
 
-        if result is None:
+        if best is None:
             if not cfg.fallback_on_failure:
                 raise RuntimeError(f"切块 {label} 重绘失败: {last_error}")
             failed.append(label)
             result = ref_tile.copy()
         else:
-            result = await asyncio.to_thread(_postprocess, result, ref_tile, cfg, label, unaligned)
+            if not best.aligned:
+                unaligned.append(label)
+            if best.patched > 0.005:
+                patched[label] = best.patched
+            result = best.image
         done += 1
         await report(5 + int(85 * done / total), f"已完成 {done}/{total} 块")
         return result
 
     tiles = await asyncio.gather(*(run(tile) for tile in plan.tiles))
     await report(92, "正在拼接")
-    merged = await asyncio.to_thread(stitch, plan, tiles, cfg.seam_feather)
+    merged = await asyncio.to_thread(stitch, plan, tiles, cfg.seam_feather, ref_arr)
+    merged = await asyncio.to_thread(anchor_to_source, merged, to_array(src), cfg.color_correction)
     output = to_image(merged)
     if alpha is not None:
         output = output.convert("RGBA")
@@ -177,12 +204,45 @@ async def upscale(
         scale_reduced=reduced,
         failed_tiles=sorted(failed),
         unaligned_tiles=sorted(unaligned),
+        patched_tiles=dict(sorted(patched.items())),
     )
 
 
-def _postprocess(tile: np.ndarray, ref_tile: np.ndarray, cfg: UpscaleConfig, label: str, unaligned: List[str]) -> np.ndarray:
+@dataclass
+class TileCandidate:
+    image: np.ndarray
+    aligned: bool
+    deviation: float
+    """Share of the tile whose layout differs from the original after alignment."""
+    patched: float
+    weight: np.ndarray = field(repr=False, default=None)
+
+    @property
+    def score(self) -> float:
+        return self.deviation + (0 if self.aligned else 1.0)
+
+
+def _save_debug(directory: Path, stem: str, raw: np.ndarray, candidate: "TileCandidate") -> None:
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        to_image(raw).save(directory / f"{stem}_model.png")
+        to_image(candidate.image).save(directory / f"{stem}_fixed.png")
+        Image.fromarray((np.clip(candidate.weight, 0, 1) * 255).astype(np.uint8), "L").save(directory / f"{stem}_patched.png")
+    except Exception as e:
+        logger.debug(f"[图片放大] 保存调试图失败: {e}")
+
+
+def _postprocess(tile: np.ndarray, ref_tile: np.ndarray, cfg: UpscaleConfig, scale: float) -> TileCandidate:
+    """Register, colour-match and patch one redrawn tile against the reference."""
+    aligned = True
     if cfg.align:
-        tile, ok = align_to_reference(tile, ref_tile)
-        if not ok:
-            unaligned.append(label)
-    return match_low_frequency(tile, ref_tile, cfg.color_correction)
+        tile, aligned = align_to_reference(tile, ref_tile, local=cfg.local_align)
+    tile = match_low_frequency(tile, ref_tile, cfg.color_correction)
+    weight, deviation = deviation_mask(tile, ref_tile, scale, cfg.deviation_threshold)
+    if not aligned:
+        # A tile that could not be registered is not trusted anywhere.
+        weight = np.ones(tile.shape[:2], np.float32)
+    patched = float(weight.mean())
+    if patched > 0:
+        tile = tile * (1 - weight[..., None]) + ref_tile * weight[..., None]
+    return TileCandidate(image=tile, aligned=aligned, deviation=deviation if aligned else 1.0, patched=patched, weight=weight)
