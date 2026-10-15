@@ -204,3 +204,52 @@ def test_unregistrable_tile_falls_back_to_the_original():
     ref = np.asarray(src.resize(result.image.size, Image.LANCZOS), np.float32)
     assert result.unaligned_tiles
     assert np.abs(np.asarray(result.image, np.float32) - ref).mean() < 4.0
+
+
+def test_aligned_redraw_with_corrected_text_is_kept_as_drawn():
+    """Regression (real GPT Image run): the model kept the canvas in place and
+    fixed garbled glyphs. Patching from the original ghosted the new digits and
+    optical flow bent the corrected characters; the redraw must pass through."""
+    src = _poster()
+    panel = (240, 228, 210)
+    draw_src = ImageDraw.Draw(src)
+    # Text on a flat panel, as on the poster's cards; the source text is garbled.
+    draw_src.rectangle([10, 10, 170, src.height - 10], fill=panel)
+    for y in range(20, src.height - 20, 45):
+        draw_src.text((16, y), "3%0O kj-45#O", fill=(10, 10, 10))
+
+    async def fix_text(prompt, data, size):
+        with Image.open(BytesIO(data)) as im:
+            out = im.convert("RGB")
+        if prompt.split("这是", 1)[-1].split("，", 1)[0].endswith("第 1 列"):
+            draw = ImageDraw.Draw(out)
+            # Same lines on the same panel, correct glyphs: only the characters change.
+            for y in range(40, out.height - 40, 90):
+                draw.rectangle([30, y, 300, y + 26], fill=panel)
+                draw.text((34, y + 6), "3500 - 4500 OK", fill=(10, 10, 10))
+        buf = BytesIO()
+        out.save(buf, format="PNG")
+        return buf.getvalue()
+
+    redrawn = {}
+
+    async def recording(prompt, data, size):
+        result = await fix_text(prompt, data, size)
+        redrawn[prompt] = result
+        return result
+
+    cfg = UpscaleConfig(tile_sizes=["1024x1024"], retries=0)
+    result = asyncio.run(upscale_mod.upscale(src, scale=2.0, cfg=cfg, redraw=recording))
+    assert not result.patched_tiles and not result.unaligned_tiles
+    out = np.asarray(result.image, np.float32)
+    tile = result.plan.tiles[0]
+    first = next(data for prompt, data in redrawn.items() if "第 1 行第 1 列" in prompt)
+    model = np.asarray(Image.open(BytesIO(first)).convert("RGB"), np.float32)
+    # Where only this tile covers the image, the output is the model's
+    # drawing: identical detail (no ghost, no bending), colour may be adjusted.
+    second_row = min(t.y for t in result.plan.tiles if t.row == 1)
+    inner = (slice(20, second_row - 10), slice(20, 320))
+    detail = lambda a: a - cv2.GaussianBlur(a, (0, 0), 8)
+    ghost = np.abs(detail(out)[inner] - detail(model)[inner])
+    assert ghost.mean() < 0.05 and ghost.max() < 3.0
+    assert np.abs(out[inner] - model[inner]).mean() < 10.0

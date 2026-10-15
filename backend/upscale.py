@@ -25,7 +25,7 @@ from .tiling import (
     align_to_reference,
     anchor_to_source,
     deviation_mask,
-    match_low_frequency,
+    match_colour,
     plan_tiles,
     stitch,
     to_array,
@@ -236,9 +236,9 @@ def _postprocess(tile: np.ndarray, ref_tile: np.ndarray, cfg: UpscaleConfig, sca
     """Register, colour-match and patch one redrawn tile against the reference."""
     aligned = True
     if cfg.align:
-        tile, aligned = align_to_reference(tile, ref_tile, local=cfg.local_align)
-    tile = match_low_frequency(tile, ref_tile, cfg.color_correction)
-    weight, deviation = deviation_mask(tile, ref_tile, scale, cfg.deviation_threshold)
+        tile, aligned = align_to_reference(tile, ref_tile, local=cfg.local_flow)
+    tile = match_colour(tile, ref_tile, cfg.color_correction)
+    weight, deviation = deviation_mask(tile, ref_tile, scale, cfg.layout_threshold)
     if not aligned:
         # A tile that could not be registered is not trusted anywhere.
         weight = np.ones(tile.shape[:2], np.float32)

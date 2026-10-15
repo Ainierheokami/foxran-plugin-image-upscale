@@ -7,7 +7,7 @@ each tile is "redraw this canvas sharper" rather than "invent a bigger image".
 
 Pipeline per tile: model output -> resize to the tile box -> register to the
 interpolated reference (SIFT/ECC affine, then smoothed optical flow) ->
-low-frequency colour correction -> regions whose layout still deviates fall
+per-tile colour fit -> regions whose layout still deviates fall
 back to the reference. Neighbouring tiles are joined along a
 minimum-difference seam inside their overlap, so text that two tiles redrew
 slightly differently is cut around instead of cross-faded into a ghost; the
@@ -226,11 +226,14 @@ def _ecc_warp(ref_g: np.ndarray, tile_g: np.ndarray, init: np.ndarray) -> Option
     return warp
 
 
-def _local_flow(aligned: np.ndarray, reference: np.ndarray, max_ratio: float) -> np.ndarray:
+def _local_flow(aligned: np.ndarray, reference: np.ndarray, max_ratio: float, min_median_px: float = 3.0) -> np.ndarray:
     """Correct smooth local drift (elements nudged by a few pixels) with optical flow.
 
-    The flow is blurred heavily so it moves whole elements back, never
-    individual strokes: redrawn text keeps its new, correct shape.
+    Applied only when the tile as a whole has drifted (median displacement
+    of at least ``min_median_px``). On a tile that is in place, the flow is
+    near zero almost everywhere and spikes only where the model rewrote
+    glyphs or on flat areas; warping by that would bend the corrected text.
+    The flow is blurred heavily so it moves whole elements, not strokes.
     """
     h, w = reference.shape[:2]
     factor, small = _small_size(h, w, 768)
@@ -244,6 +247,8 @@ def _local_flow(aligned: np.ndarray, reference: np.ndarray, max_ratio: float) ->
     magnitude = np.linalg.norm(flow, axis=2, keepdims=True)
     flow = flow * np.minimum(1.0, limit / (magnitude + 1e-6))
     flow = cv2.resize(flow, (w, h), interpolation=cv2.INTER_LINEAR) / factor
+    if float(np.median(np.linalg.norm(flow, axis=2))) < min_median_px:
+        return aligned
     gx, gy = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
     return cv2.remap(aligned, gx + flow[..., 0], gy + flow[..., 1], cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
 
@@ -284,6 +289,10 @@ def align_to_reference(
 
     full = warp.copy()
     full[:, 2] /= factor
+    if _negligible(full, w, h):
+        # GPT Image usually keeps the canvas; resampling a tile that is
+        # already in place only softens it.
+        return tile, True
     aligned = cv2.warpAffine(
         tile, full, (w, h),
         flags=cv2.INTER_CUBIC | cv2.WARP_INVERSE_MAP,
@@ -294,35 +303,69 @@ def align_to_reference(
     return aligned, True
 
 
-def deviation_mask(tile: np.ndarray, reference: np.ndarray, scale: float, threshold: float) -> Tuple[np.ndarray, float]:
+def _negligible(warp: np.ndarray, w: int, h: int, tolerance_px: float = 1.0) -> bool:
+    """Whether the warp moves every corner of the tile by less than ``tolerance_px``."""
+    corners = np.array([[0, 0], [w, 0], [0, h], [w, h]], np.float64)
+    moved = corners @ warp[:, :2].T.astype(np.float64) + warp[:, 2].astype(np.float64)
+    return float(np.abs(moved - corners).max()) < tolerance_px
+
+
+def deviation_mask(
+    tile: np.ndarray, reference: np.ndarray, scale: float, threshold: float, min_area: float = 0.01,
+) -> Tuple[np.ndarray, float]:
     """Where the redrawn tile no longer matches the layout of the original.
 
-    Both are blurred to a few source pixels, so sharper edges and corrected
-    glyphs barely register while moved, missing or invented elements do.
-    Returns a feathered weight for the reference (1 = use the reference) and
-    the share of the tile that deviates.
+    Compares structure, not intensity: local zero-mean normalised correlation
+    on coarse greyscale copies (below glyph detail). A brighter sky or richer
+    colours keep a high correlation; content that moved, vanished or appeared
+    does not. ``threshold`` (0~100) is how low the correlation may drop, in
+    percent, before a region counts. Only regions covering at least
+    ``min_area`` of the tile are returned, as a weight for the reference
+    (1 = use the reference), with the share of the tile that deviates.
     """
-    sigma = max(1.5, 3.0 * scale)
-    diff = np.abs(cv2.GaussianBlur(tile, (0, 0), sigma) - cv2.GaussianBlur(reference, (0, 0), sigma)).mean(axis=2)
-    bad = (diff > threshold).astype(np.uint8)
-    size = max(3, int(round(2 * scale)) | 1)
-    bad = cv2.morphologyEx(bad, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size)))
+    h, w = reference.shape[:2]
+    factor = 1.0 / max(2.0, 2.0 * scale)
+    size = (max(16, round(w * factor)), max(16, round(h * factor)))
+    a = cv2.resize(cv2.cvtColor(np.clip(tile, 0, 255).astype(np.float32), cv2.COLOR_RGB2GRAY), size, interpolation=cv2.INTER_AREA)
+    b = cv2.resize(cv2.cvtColor(np.clip(reference, 0, 255).astype(np.float32), cv2.COLOR_RGB2GRAY), size, interpolation=cv2.INTER_AREA)
+    sigma = 6.0
+    blur = lambda x: cv2.GaussianBlur(x, (0, 0), sigma)
+    ma, mb = blur(a), blur(b)
+    va = np.maximum(blur(a * a) - ma * ma, 0)
+    vb = np.maximum(blur(b * b) - mb * mb, 0)
+    cov = blur(a * b) - ma * mb
+    textured_a, textured_b = va > 25.0, vb > 25.0  # local std above 5 grey levels
+    ncc = cov / np.sqrt(np.maximum(va * vb, 1e-6))
+    min_corr = 1.0 - float(threshold) / 100.0
+    bad = np.where(
+        textured_a & textured_b,
+        ncc < min_corr,
+        # Texture on one side only: something appeared or vanished. Flat on
+        # both sides is fine whatever the shade.
+        textured_a != textured_b,
+    ).astype(np.uint8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(bad, connectivity=8)
+    keep = np.zeros(count, bool)
+    keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= min_area * bad.size
+    bad = keep[labels].astype(np.uint8)
     ratio = float(bad.mean())
     if not ratio:
-        return np.zeros(diff.shape, np.float32), 0.0
-    grow = max(3, int(round(6 * scale)) | 1)
-    mask = cv2.dilate(bad, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (grow, grow))).astype(np.float32)
-    mask = cv2.GaussianBlur(mask, (0, 0), max(1.0, 2.0 * scale))
-    return np.clip(mask * 1.5, 0, 1), ratio
+        return np.zeros((h, w), np.float32), 0.0
+    mask = cv2.resize(bad.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+    grow = max(3, int(round(4 * scale)) | 1)
+    mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (grow, grow)))
+    # A narrow edge: a wide blend would overlay two versions of the content.
+    mask = cv2.GaussianBlur(mask, (0, 0), max(1.0, scale))
+    return np.clip(mask * 2.0, 0, 1), ratio
 
 
 def anchor_to_source(output: np.ndarray, source: np.ndarray, strength: float, iterations: int = 2) -> np.ndarray:
     """Make the result agree with the original once scaled back down.
 
-    Back-projects the smoothed difference between the source and the
-    downscaled result. Only broad colour and brightness move (smoothing keeps
-    redrawn strokes), which removes tile-to-tile colour steps, including on
-    flat backgrounds where seams have nothing else to hide behind.
+    Back-projects the heavily smoothed difference between the source and the
+    downscaled result. Only broad colour and brightness move, which removes
+    tile-to-tile colour steps, including on flat backgrounds where seams have
+    nothing else to hide behind.
     """
     if strength <= 0:
         return output
@@ -331,22 +374,44 @@ def anchor_to_source(output: np.ndarray, source: np.ndarray, strength: float, it
     result = output.astype(np.float32)
     for _ in range(max(1, iterations)):
         down = cv2.resize(result, (sw, sh), interpolation=cv2.INTER_AREA)
-        residual = cv2.GaussianBlur(source - down, (0, 0), 1.0)
+        # Smoothed well past glyph size: only colour and brightness move, so
+        # the source's garbled strokes are not painted back over fixed text.
+        residual = cv2.GaussianBlur(source - down, (0, 0), 16.0)
         result = result + cv2.resize(residual, (ow, oh), interpolation=cv2.INTER_CUBIC) * float(min(strength, 1.0))
     return result
 
 
-def match_low_frequency(tile: np.ndarray, reference: np.ndarray, strength: float) -> np.ndarray:
-    """Pull the tile's broad colour/brightness back to the reference.
+def match_colour(tile: np.ndarray, reference: np.ndarray, strength: float) -> np.ndarray:
+    """Undo a colour cast the model put on the whole tile.
 
-    Only the heavily blurred component is replaced, so sharpened edges and
-    redrawn text stay intact while tile-to-tile colour drift disappears.
+    Fits one gain and offset per channel (reference ~ gain * tile + offset)
+    on blurred copies, ignoring pixels where the content differs (redrawn
+    text, fixed details), and applies it to the tile. A global fit cannot
+    paint the original's content back the way a per-pixel low-frequency
+    correction does.
     """
     if strength <= 0:
         return tile
-    sigma = max(4.0, max(tile.shape[:2]) / 24)
-    delta = cv2.GaussianBlur(reference, (0, 0), sigma) - cv2.GaussianBlur(tile, (0, 0), sigma)
-    return tile + delta * float(min(strength, 1.0))
+    t = cv2.GaussianBlur(tile, (0, 0), 3.0).reshape(-1, 3)
+    r = cv2.GaussianBlur(reference, (0, 0), 3.0).reshape(-1, 3)
+    step = max(1, len(t) // 200_000)
+    t, r = t[::step].astype(np.float64), r[::step].astype(np.float64)
+    keep = np.ones(len(t), bool)
+    gains, offsets = np.ones(3), np.zeros(3)
+    for _ in range(3):
+        for c in range(3):
+            x, y = t[keep, c], r[keep, c]
+            if x.size < 100 or x.std() < 1.0:
+                gains[c], offsets[c] = 1.0, float(np.median(y - x)) if x.size else 0.0
+                continue
+            gains[c], offsets[c] = np.polyfit(x, y, 1)
+        residual = np.abs(r - (t * gains + offsets)).mean(axis=1)
+        keep = residual <= max(4.0, np.percentile(residual, 70))
+    gains = np.clip(gains, 0.8, 1.25)
+    offsets = np.clip(offsets, -40, 40)
+    corrected = tile * gains + offsets
+    k = float(min(strength, 1.0))
+    return tile * (1 - k) + corrected * k
 
 
 # ---------------------------------------------------------------- stitching
