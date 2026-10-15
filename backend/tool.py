@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 from app.logger import setup_logger
 from app.runtime.paths import TMP_DIR
 from app.tools.base import BaseTool, ToolInputSchema, ToolResult
+from app.tools.commands import ToolCommand
 
 from .config import UpscaleConfig, load_config
 from .upscale import UpscaleResult, upscale
@@ -147,6 +148,20 @@ class ImageHDUpscaleTool(BaseTool):
     result_visibility = "user_visible"
     capabilities: List[str] = ["image.upscale"]
     args_schema: Type[BaseModel] = ImageHDUpscaleInput
+    commands = [
+        ToolCommand(
+            name="image_hd_upscale",
+            patterns=["/放大", "/高清", "/upscale"],
+            text_arg="text_hint",
+            text_required=False,
+            image_arg="path",
+            image_required=True,
+            description="图片高清放大并修复乱码文字（附带图片或引用一条带图片的消息）",
+            usage_hint="/放大 [图中文字的正确内容] + 图片",
+            start_text="收到，正在分块高清重绘，可能要几分钟～",
+            done_text="放大好啦：",
+        ),
+    ]
 
     async def execute(self, **kwargs: Any) -> ToolResult:
         status_callback = kwargs.get("status_callback")
