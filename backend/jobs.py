@@ -18,7 +18,7 @@ import shutil
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from PIL import Image
 
@@ -42,6 +42,7 @@ class Job:
     plan: TilePlan
     scale: float
     text_hint: str = ""
+    fixes: List[Tuple[str, str]] = field(default_factory=list)
     session_id: str = ""
     outputs: List[str] = field(default_factory=list)
     statuses: Dict[str, dict] = field(default_factory=dict)
@@ -81,6 +82,7 @@ def save_job(
     output: Path,
     text_hint: str,
     session_id: str,
+    fixes: Sequence[Tuple[str, str]] = (),
     job: Optional[Job] = None,
     keep: int = 0,
 ) -> Job:
@@ -94,6 +96,7 @@ def save_job(
         (job.directory / "tiles").mkdir(parents=True, exist_ok=True)
         source.save(job.directory / "source.png")
     job.text_hint = text_hint
+    job.fixes = [tuple(f) for f in fixes]
     job.session_id = session_id or job.session_id
     job.outputs.append(str(output.resolve()))
     for label in result.redrawn or list(result.tiles):
@@ -108,6 +111,7 @@ def save_job(
         "version": VERSION,
         "scale": job.scale,
         "text_hint": job.text_hint,
+        "fixes": [list(f) for f in job.fixes],
         "session_id": job.session_id,
         "outputs": job.outputs,
         "plan": _plan_to_dict(job.plan),
@@ -131,6 +135,7 @@ def _load(directory: Path) -> Optional[Job]:
             plan=_plan_from_dict(meta["plan"]),
             scale=float(meta["scale"]),
             text_hint=meta.get("text_hint", ""),
+            fixes=[tuple(f) for f in meta.get("fixes", []) if len(f) == 2],
             session_id=meta.get("session_id", ""),
             outputs=list(meta.get("outputs", [])),
             statuses=dict(meta.get("tiles", {})),

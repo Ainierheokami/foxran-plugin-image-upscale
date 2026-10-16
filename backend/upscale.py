@@ -11,7 +11,7 @@ import math
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
-from typing import Awaitable, Callable, Collection, Dict, List, Optional
+from typing import Awaitable, Callable, Collection, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image
@@ -116,10 +116,18 @@ RETRY_PROMPT = (
 )
 
 
-def build_prompt(plan: TilePlan, tile: Tile, text_hint: str, extra: str, *, retry: bool = False) -> str:
+def build_prompt(
+    plan: TilePlan, tile: Tile, text_hint: str, extra: str, *, retry: bool = False, fixes: Sequence[Tuple[str, str]] = (),
+) -> str:
     parts = [BASE_PROMPT.format(where=_where(plan, tile))]
     if retry:
         parts.append(RETRY_PROMPT)
+    if fixes:
+        listed = "；".join(f"「{wrong}」→「{right}」" for wrong, right in fixes)
+        parts.append(
+            f"图中有些字画错了，重绘时把本块里出现的这些错字改成正确的字（左边是图里画的，右边是正确的），"
+            f"字体、字号和位置保持不变；本块里没有的不用管：{listed}。"
+        )
     if text_hint:
         parts.append(
             f"整张图里文字的正确内容如下，仅用于修正本块中出现的文字，本块没有的文字不要画进来：{text_hint}"
@@ -161,6 +169,7 @@ async def upscale(
     plan: Optional[TilePlan] = None,
     previous: Optional[Dict[str, TileOutcome]] = None,
     only: Optional[Collection[str]] = None,
+    fixes: Sequence[Tuple[str, str]] = (),
 ) -> UpscaleResult:
     """Upscale ``image``; with ``plan``/``previous``/``only``, redraw just the tiles in ``only``.
 
@@ -221,7 +230,7 @@ async def upscale(
         last_error: Optional[Exception] = None
         async with semaphore:
             for attempt in range(max(0, cfg.retries) + 1):
-                prompt = build_prompt(plan, tile, text_hint, cfg.prompt, retry=failed_before or attempt > 0)
+                prompt = build_prompt(plan, tile, text_hint, cfg.prompt, retry=failed_before or attempt > 0, fixes=fixes)
                 try:
                     data = await redraw(prompt, payload, tile.request_size)
                     with Image.open(BytesIO(data)) as out:

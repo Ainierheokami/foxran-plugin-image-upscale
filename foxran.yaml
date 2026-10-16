@@ -3,9 +3,9 @@ manifest_version: 1
 extension:
   id: "image_hd_upscale"
   name: "图片放大"
-  version: "1.4.0"
+  version: "1.5.0"
   type: "tool"
-  description: "把图片按甜点尺寸带冗余切块，交给 GPT Image 2 等图像编辑模型逐块高清重绘（顺带修复乱码文字），再对齐、校色并沿最佳拼缝拼回高分辨率原图；失败的块可以按任务号单独重绘。"
+  description: "先通读整张图校对错别字和乱码，再把图片按甜点尺寸带冗余切块，交给 GPT Image 2 等图像编辑模型逐块高清重绘（顺带修复乱码文字），再对齐、校色并沿最佳拼缝拼回高分辨率原图；失败的块可以按任务号单独重绘。"
   author: "Ainierheokami"
   repository: "https://github.com/Ainierheokami/foxran-plugin-image-upscale"
   tags:
@@ -14,8 +14,9 @@ extension:
     - "upscale"
 
 compatibility:
-  foxran: ">=4.5.0"
+  foxran: ">=4.5.3"
   python: ">=3.10"
 
 tool:
   entry: "__init__.py"
+  frontend_bundle: "index.umd.js"

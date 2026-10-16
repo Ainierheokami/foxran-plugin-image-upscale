@@ -1,5 +1,6 @@
 from app.logger import setup_logger
 
+from .backend.api import router
 from .backend.tool import ImageHDUpscaleTool
 
 
@@ -15,4 +16,4 @@ async def startup() -> None:
     logger.info("Image HD upscale plugin started")
 
 
-__all__ = ["ImageHDUpscaleTool", "register_tool_classes", "startup"]
+__all__ = ["ImageHDUpscaleTool", "register_tool_classes", "router", "startup"]

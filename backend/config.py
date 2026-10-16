@@ -38,6 +38,8 @@ class UpscaleConfig(BaseModel):
     color_correction: float = Field(0.8, description="校色强度 0~1：各块低频校色，拼好后再按原图整体校正；0 关闭。")
     seam_feather: float = Field(6.0, description="拼缝羽化半径（像素）。")
     fallback_on_failure: bool = Field(True, description="某块重试仍失败时用普通插值顶上，而不是整张失败。")
+    proofread: bool = Field(True, description="放大前先让视觉模型通读整张图，按上下文找出错别字和乱码，把修正写进每块的提示词。")
+    proofread_model: str = Field("", description="校对用的视觉模型名（models.yaml）；留空按 vision 标签选。")
     prompt: str = Field("", description="附加在每块提示词末尾的自定义要求。")
     keep_jobs: int = Field(0, description="保留最近多少次放大记录（原图和各块结果，用于 /放大重试）；0 表示一直保留。")
     save_tiles: bool = Field(False, description="调试用：把每块的模型原图、修正后结果和填补区域保存到 tmp/image_hd_upscale/debug/。")

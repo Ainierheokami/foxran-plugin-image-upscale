@@ -54,6 +54,13 @@ seam_feather: 6.0
 # 某块重试仍失败时用普通插值顶上（结果里会注明），关闭则整张失败。
 fallback_on_failure: true
 
+# 放大前先让视觉模型通读整张图，按上下文找出错别字和乱码（如“做蠣启德”应为“坐落启德”），
+# 把修正写进每块的提示词。命令后面写的文字（text_hint）会作为校对依据。多一次模型调用；失败不影响放大。
+proofread: true
+
+# 校对用的视觉模型名（models.yaml）；留空按 vision 标签选。
+proofread_model: ""
+
 # 附加在每块提示词末尾的自定义要求。
 prompt: ""
 

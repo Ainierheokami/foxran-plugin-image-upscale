@@ -354,6 +354,12 @@ def test_tool_retry_by_id_or_latest_of_the_chat(tmp_path, monkeypatch):
         return src.copy()
 
     monkeypatch.setattr(tool_mod, "_load_input", load)
+
+    async def no_vision(_messages):
+        raise RuntimeError("没有视觉模型")
+
+    # Proofreading failing must not stop the upscale.
+    monkeypatch.setattr(tool_mod, "_make_ask", lambda _cfg: no_vision)
     model = {"redraw": _bad_at("1-2")}
     monkeypatch.setattr(tool_mod, "_make_redraw", lambda _cfg: lambda *a: model["redraw"](*a))
     tool = tool_mod.ImageHDUpscaleTool()
@@ -417,3 +423,104 @@ def test_automatic_retry_uses_the_stronger_prompt():
     assert len(bad) == 2
     assert upscale_mod.RETRY_PROMPT not in bad[0] and upscale_mod.RETRY_PROMPT in bad[1]
     assert all(upscale_mod.RETRY_PROMPT not in p for p in prompts if "第 1 行第 1 列" not in p)
+
+
+proof_mod = sys.modules[f"{pkg.__name__}.backend.proofread"]
+
+
+def test_proofread_reply_is_parsed_leniently():
+    reply = """好的，结果如下：
+```json
+{"text": "坐落启德跑道前端，临海而建", "fixes": [{"from": "做蠣启德", "to": "坐落启德"}, {"from": "同", "to": "同"}, "x"]}
+```"""
+    result = proof_mod.parse_reply(reply)
+    assert result.text.startswith("坐落") and result.fixes == [("做蠣启德", "坐落启德")]
+    with pytest.raises(ValueError):
+        proof_mod.parse_reply("看不清")
+
+
+def test_corrections_reach_every_tile_and_survive_a_retry(tmp_path, monkeypatch):
+    src = _poster()
+    monkeypatch.setattr(tool_mod, "JOBS_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(tool_mod, "OUTPUT_DIR", tmp_path / "out")
+    monkeypatch.setattr(tool_mod, "load_config", lambda: UpscaleConfig(tile_sizes=["1024x1024"], retries=0))
+
+    async def load(_raw, _ctx):
+        return src.copy()
+
+    monkeypatch.setattr(tool_mod, "_load_input", load)
+    asked = []
+
+    async def vision(messages):
+        asked.append(messages)
+        return '{"text": "坐落启德跑道前端", "fixes": [{"from": "做蠣启德", "to": "坐落启德"}]}'
+
+    monkeypatch.setattr(tool_mod, "_make_ask", lambda _cfg: vision)
+    prompts = []
+    model = _fake_model(4)
+
+    async def recording(prompt, data, size):
+        prompts.append(prompt)
+        return await model(prompt, data, size)
+
+    monkeypatch.setattr(tool_mod, "_make_redraw", lambda _cfg: recording)
+    tool = tool_mod.ImageHDUpscaleTool()
+    ctx = type("Ctx", (), {"session_id": "s1"})()
+
+    first = asyncio.run(tool.execute(path="x.png", text_hint="坐落", session_ctx=ctx))
+    assert first.success, first.error
+    assert len(asked) == 1
+    user_text = asked[0][1]["content"][0]["text"]
+    assert "以它为准：坐落" in user_text
+    assert asked[0][1]["content"][1]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert prompts and all("「做蠣启德」→「坐落启德」" in p for p in prompts)
+    assert "做蠣启德→坐落启德" in first.data
+
+    job_id = __import__("re").search(r"任务号 ([0-9a-f]{6})", first.data).group(1)
+    prompts.clear()
+    again = asyncio.run(tool.execute(retry_tiles=f"{job_id} 1-1", session_ctx=ctx))
+    assert again.success, again.error
+    # No second proofread; the saved corrections are reused.
+    assert len(asked) == 1 and len(prompts) == 1 and "「做蠣启德」→「坐落启德」" in prompts[0]
+
+
+# --- settings API ------------------------------------------------------------------------
+
+api_mod = sys.modules[f"{pkg.__name__}.backend.api"]
+config_mod = sys.modules[f"{pkg.__name__}.backend.config"]
+
+
+def test_settings_api_validates_and_keeps_comments(tmp_path, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    path = tmp_path / "image_hd_upscale.yaml"
+    path.write_text(config_mod.TEMPLATE_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setattr(api_mod, "CONFIG_PATH", path)
+    monkeypatch.setattr(config_mod, "CONFIG_PATH", path)
+    monkeypatch.setattr(config_mod, "_cache", None)
+    app = FastAPI()
+    app.include_router(api_mod.router)
+    app.dependency_overrides[api_mod.require_auth] = lambda: True
+    client = TestClient(app)
+
+    got = client.get("/api/v1/plugins/image-hd-upscale/config").json()
+    assert got["config"]["proofread"] is True and "错别字" in got["descriptions"]["proofread"]
+
+    cfg = dict(got["config"], proofread=False, proofread_model="qwen-vl", tile_sizes=["1536x1024"], retries=2)
+    saved = client.post("/api/v1/plugins/image-hd-upscale/config", json={"config": cfg})
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["config"]["proofread_model"] == "qwen-vl"
+    text = path.read_text(encoding="utf-8")
+    assert "# 放大前先让视觉模型通读整张图" in text and "proofread: false" in text and "retries: 2" in text
+
+    for bad, word in [
+        (dict(cfg, overlap_ratio=0.9), "overlap_ratio"),
+        (dict(cfg, tile_sizes=["abc"]), "abc"),
+        (dict(cfg, default_scale=5, max_scale=4), "default_scale"),
+        (dict(cfg, output_format="gif"), "output_format"),
+        (dict(cfg, mystery=1), "mystery"),
+    ]:
+        rejected = client.post("/api/v1/plugins/image-hd-upscale/config", json={"config": bad})
+        assert rejected.status_code == 400 and word in rejected.json()["detail"]
+    assert "retries: 2" in path.read_text(encoding="utf-8")

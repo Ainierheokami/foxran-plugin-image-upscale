@@ -1,0 +1,20 @@
+{
+  "name": "foxran-plugin-image-upscale-web",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "vue-tsc --noEmit && vite build"
+  },
+  "dependencies": {
+    "lucide-vue-next": "^0.562.0",
+    "vue": "^3.5.18"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.1",
+    "typescript": "~5.8.3",
+    "vite": "^7.1.0",
+    "vite-plugin-css-injected-by-js": "^3.5.2",
+    "vue-tsc": "^3.0.5"
+  }
+}

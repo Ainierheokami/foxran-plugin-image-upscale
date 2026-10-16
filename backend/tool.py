@@ -6,7 +6,7 @@ import tempfile
 import time
 from io import BytesIO
 from pathlib import Path
-from typing import Any, List, Optional, Type
+from typing import Any, List, Optional, Sequence, Tuple, Type
 from uuid import uuid4
 
 from PIL import Image
@@ -19,6 +19,7 @@ from app.tools.commands import ToolCommand
 
 from .config import UpscaleConfig, load_config
 from .jobs import Job, find_job, parse_labels, save_job, split_retry_text
+from .proofread import make_ask, try_proofread
 from .upscale import UpscaleResult, tiles_worth_retrying, upscale
 
 
@@ -94,6 +95,10 @@ def _make_redraw(cfg: UpscaleConfig):
     return redraw
 
 
+def _make_ask(cfg: UpscaleConfig):
+    return make_ask(cfg.proofread_model)
+
+
 def _resolve_input_path(raw: str, session_ctx: Any) -> str:
     text = str(raw or "").strip()
     if text.replace("\\", "/").startswith("/workspace"):
@@ -136,7 +141,10 @@ def save_output(image: Image.Image, cfg: UpscaleConfig) -> Path:
     return path
 
 
-def describe(result: UpscaleResult, src_size: tuple[int, int], seconds: float, *, job_id: str = "", retry: bool = False) -> str:
+def describe(
+    result: UpscaleResult, src_size: tuple[int, int], seconds: float, *,
+    job_id: str = "", retry: bool = False, fixes: Sequence[Tuple[str, str]] = (),
+) -> str:
     plan = result.plan
     if retry:
         lines = [
@@ -150,6 +158,9 @@ def describe(result: UpscaleResult, src_size: tuple[int, int], seconds: float, *
         ]
     if result.scale_reduced:
         lines.append("倍率超出块数/像素上限，已自动降低。")
+    if fixes and not retry:
+        listed = "、".join(f"{wrong}→{right}" for wrong, right in fixes)
+        lines.append(f"校对出 {len(fixes)} 处错字，已让模型按正确的字重绘：{listed}。猜错了可以在命令后面写上正确的文字再放大一次。")
     if result.failed_tiles:
         lines.append(f"第 {', '.join(result.failed_tiles)} 块重绘失败，用普通插值代替。")
     if result.unaligned_tiles:
@@ -276,7 +287,7 @@ class ImageHDUpscaleTool(BaseTool):
                 return ToolResult(tool_name=self.name, success=False, error="没有指定要重绘的块")
         return await self._run(
             job.source(), cfg, session_ctx, status_callback,
-            scale=job.scale, text_hint=text_hint or job.text_hint, job=job, previous=previous, only=labels,
+            scale=job.scale, text_hint=text_hint or job.text_hint, job=job, previous=previous, only=labels, fixes=job.fixes,
         )
 
     async def _run(
@@ -291,11 +302,19 @@ class ImageHDUpscaleTool(BaseTool):
         job: Optional[Job] = None,
         previous: Optional[dict] = None,
         only: Optional[List[str]] = None,
+        fixes: Sequence[Tuple[str, str]] = (),
     ) -> ToolResult:
         async def progress(percent: int, message: str) -> None:
             await self.report_progress(percent, message, status_callback)
 
         started = time.monotonic()
+        fixes = list(fixes)
+        if job is None and cfg.proofread:
+            await progress(2, "正在校对图中文字")
+            checked = await try_proofread(image, _make_ask(cfg), text_hint)
+            if checked is not None:
+                fixes = checked.fixes
+                text_hint = text_hint or checked.text
         try:
             result = await upscale(
                 image,
@@ -308,6 +327,7 @@ class ImageHDUpscaleTool(BaseTool):
                 plan=job.plan if job else None,
                 previous=previous,
                 only=only,
+                fixes=fixes,
             )
         except Exception as e:
             logger.error(f"[图片放大] 处理失败: {e}", exc_info=True)
@@ -323,13 +343,14 @@ class ImageHDUpscaleTool(BaseTool):
         try:
             saved = await asyncio.to_thread(
                 save_job, JOBS_DIR,
-                source=image, result=result, output=path, text_hint=text_hint,
+                source=image, result=result, output=path, text_hint=text_hint, fixes=fixes,
                 session_id=str(getattr(session_ctx, "session_id", "") or ""), job=job, keep=cfg.keep_jobs,
             )
         except Exception as e:
             logger.warning(f"[图片放大] 保存放大记录失败，之后无法单独重试切块: {e}")
         summary = describe(
-            result, image.size, time.monotonic() - started, job_id=saved.id if saved else "", retry=job is not None,
+            result, image.size, time.monotonic() - started,
+            job_id=saved.id if saved else "", retry=job is not None, fixes=fixes,
         )
         logger.info(f"[图片放大] {summary} 输出: {path}")
         return ToolResult(tool_name=self.name, success=True, data=f"[image,url={path.resolve()}]\n{summary}")
