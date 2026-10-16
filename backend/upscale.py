@@ -11,7 +11,7 @@ import math
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
-from typing import Awaitable, Callable, List, Optional
+from typing import Awaitable, Callable, Collection, Dict, List, Optional
 
 import numpy as np
 from PIL import Image
@@ -39,12 +39,33 @@ Redraw = Callable[[str, bytes, str], Awaitable[bytes]]
 Progress = Callable[[int, str], Awaitable[None]]
 
 BASE_PROMPT = (
-    "这是一张大图切下来的局部（{where}）。请把它重绘成清晰锐利的高清版本："
+    "这是一张大图切下来的局部（{where}），画面里可能同时有好几块互不相关的内容，四边都可能是被截断的。"
+    "请原样重绘整个画面，输出的画面范围必须和输入完全相同：输入里的每一部分，包括四周被截断的地图、文字、图片和卡片，"
+    "都要画在原来的位置、保持原来的大小，不要只挑其中某个卡片、图片或主体放大铺满画面。"
+    "在此基础上把它画成清晰锐利的高清版本："
     "构图、每个元素的位置和大小、颜色、字体样式都必须与原图完全一致，"
     "不要增删任何内容，不要移动、缩放、裁切或补边，不要加边框或水印；"
     "把模糊、发虚的细节画清楚，把乱码、糊掉或笔画错误的文字修正成清晰正确的文字。"
     "画面边缘被截断的元素保持截断，不要补全。"
 )
+
+
+FAILED = "failed"
+UNALIGNED = "unaligned"
+DEVIATED = "deviated"
+REDRAWN = "redrawn"
+
+
+@dataclass
+class TileOutcome:
+    """What ended up in one tile; kept so a later run can redraw only some tiles."""
+
+    image: np.ndarray = field(repr=False)
+    status: str = REDRAWN
+    """``redrawn``; ``deviated`` (aligned, but more than ``max_deviation`` patched from the original);
+    ``unaligned`` (interpolated: could not be registered) or ``failed`` (interpolated: no image)."""
+    patched: float = 0.0
+    """Share of the tile restored from the interpolated original."""
 
 
 @dataclass
@@ -53,10 +74,31 @@ class UpscaleResult:
     plan: TilePlan
     scale: float
     scale_reduced: bool = False
-    failed_tiles: List[str] = field(default_factory=list)
-    unaligned_tiles: List[str] = field(default_factory=list)
-    patched_tiles: dict = field(default_factory=dict)
-    """Tile label -> share of the tile restored from the interpolated original."""
+    tiles: Dict[str, TileOutcome] = field(default_factory=dict, repr=False)
+    redrawn: List[str] = field(default_factory=list)
+    """Tiles sent to the model in this run (all of them unless it was a partial retry)."""
+
+    def _labels(self, status: str) -> List[str]:
+        return [label for label, tile in self.tiles.items() if tile.status == status]
+
+    @property
+    def failed_tiles(self) -> List[str]:
+        return self._labels(FAILED)
+
+    @property
+    def unaligned_tiles(self) -> List[str]:
+        return self._labels(UNALIGNED)
+
+    @property
+    def patched_tiles(self) -> Dict[str, float]:
+        return {
+            label: tile.patched for label, tile in self.tiles.items()
+            if tile.status in (REDRAWN, DEVIATED) and tile.patched > 0.005
+        }
+
+
+def tile_label(tile: Tile) -> str:
+    return f"{tile.row + 1}-{tile.col + 1}"
 
 
 def _where(plan: TilePlan, tile: Tile) -> str:
@@ -68,8 +110,16 @@ def _where(plan: TilePlan, tile: Tile) -> str:
     return f"共 {plan.rows} 行 {plan.cols} 列，这是第 {tile.row + 1} 行第 {tile.col + 1} 列，位于整图{spot}部"
 
 
-def build_prompt(plan: TilePlan, tile: Tile, text_hint: str, extra: str) -> str:
+RETRY_PROMPT = (
+    "注意：上一次重绘的画面和输入对不上（例如只画了其中一部分并放大，或者挪动了内容）。"
+    "这次务必逐一对照输入：画面范围完全相同，每个元素的大小和位置与输入一致，四周边缘的内容一个都不能少。"
+)
+
+
+def build_prompt(plan: TilePlan, tile: Tile, text_hint: str, extra: str, *, retry: bool = False) -> str:
     parts = [BASE_PROMPT.format(where=_where(plan, tile))]
+    if retry:
+        parts.append(RETRY_PROMPT)
     if text_hint:
         parts.append(
             f"整张图里文字的正确内容如下，仅用于修正本块中出现的文字，本块没有的文字不要画进来：{text_hint}"
@@ -108,7 +158,15 @@ async def upscale(
     text_hint: str = "",
     progress: Optional[Progress] = None,
     debug_dir: Optional[Path] = None,
+    plan: Optional[TilePlan] = None,
+    previous: Optional[Dict[str, TileOutcome]] = None,
+    only: Optional[Collection[str]] = None,
 ) -> UpscaleResult:
+    """Upscale ``image``; with ``plan``/``previous``/``only``, redraw just the tiles in ``only``.
+
+    A partial retry reuses the earlier run's plan and keeps every other tile
+    exactly as it came out, then stitches everything again.
+    """
     async def report(percent: int, message: str) -> None:
         if progress:
             try:
@@ -119,25 +177,35 @@ async def upscale(
     image.load()
     alpha = image.getchannel("A") if "A" in image.getbands() else None
     src = image.convert("RGB")
-    used_scale, plan, reduced = choose_scale(src.width, src.height, scale, cfg)
+    if plan is None:
+        used_scale, plan, reduced = choose_scale(src.width, src.height, scale, cfg)
+    else:
+        used_scale, reduced = scale, False
+        if (plan.src_w, plan.src_h) != src.size:
+            raise ValueError("原图尺寸和切块方案不一致")
     reference = src.resize((plan.out_w, plan.out_h), Image.LANCZOS)
     ref_arr = to_array(reference)
-    total = len(plan.tiles)
+    previous = previous or {}
+    targets = [
+        tile for tile in plan.tiles
+        if only is None or tile_label(tile) in only or tile_label(tile) not in previous
+    ]
+    total = len(targets)
     if debug_dir is not None:
         debug_dir.mkdir(parents=True, exist_ok=True)
         reference.save(debug_dir / "reference.png")
-    await report(5, f"{src.width}x{src.height} → {plan.out_w}x{plan.out_h}，切成 {plan.rows}×{plan.cols} 块")
+    if total == len(plan.tiles):
+        await report(5, f"{src.width}x{src.height} → {plan.out_w}x{plan.out_h}，切成 {plan.rows}×{plan.cols} 块")
+    else:
+        await report(5, f"重绘第 {', '.join(tile_label(t) for t in targets)} 块（共 {plan.rows}×{plan.cols} 块）")
 
     semaphore = asyncio.Semaphore(max(1, cfg.max_concurrency))
     done = 0
-    failed: List[str] = []
-    unaligned: List[str] = []
-    patched: dict = {}
     scale_factor = (plan.scale_x + plan.scale_y) / 2
 
-    async def run(tile: Tile) -> np.ndarray:
+    async def run(tile: Tile) -> TileOutcome:
         nonlocal done
-        label = f"{tile.row + 1}-{tile.col + 1}"
+        label = tile_label(tile)
         ref_tile = ref_arr[tile.y:tile.y + tile.h, tile.x:tile.x + tile.w]
         # The model gets the interpolated tile at its request size, so it only
         # has to sharpen a canvas whose layout already matches the output.
@@ -145,12 +213,15 @@ async def upscale(
         if (tile.request_w, tile.request_h) != source.size:
             source = source.resize((tile.request_w, tile.request_h), Image.LANCZOS)
         payload = _png(source)
-        prompt = build_prompt(plan, tile, text_hint, cfg.prompt)
+        # Redrawing a tile that failed before: say so in the prompt from the first attempt.
+        earlier = previous.get(label)
+        failed_before = earlier is not None and earlier.status != REDRAWN
 
         best: Optional[TileCandidate] = None
         last_error: Optional[Exception] = None
         async with semaphore:
             for attempt in range(max(0, cfg.retries) + 1):
+                prompt = build_prompt(plan, tile, text_hint, cfg.prompt, retry=failed_before or attempt > 0)
                 try:
                     data = await redraw(prompt, payload, tile.request_size)
                     with Image.open(BytesIO(data)) as out:
@@ -177,21 +248,20 @@ async def upscale(
         if best is None:
             if not cfg.fallback_on_failure:
                 raise RuntimeError(f"切块 {label} 重绘失败: {last_error}")
-            failed.append(label)
-            result = ref_tile.copy()
+            outcome = TileOutcome(image=ref_tile.copy(), status=FAILED)
+        elif not best.aligned:
+            outcome = TileOutcome(image=best.image, status=UNALIGNED, patched=best.patched)
         else:
-            if not best.aligned:
-                unaligned.append(label)
-            if best.patched > 0.005:
-                patched[label] = best.patched
-            result = best.image
+            status = REDRAWN if best.deviation <= cfg.max_deviation else DEVIATED
+            outcome = TileOutcome(image=best.image, status=status, patched=best.patched)
         done += 1
-        await report(5 + int(85 * done / total), f"已完成 {done}/{total} 块")
-        return result
+        await report(5 + int(85 * done / max(total, 1)), f"已完成 {done}/{total} 块")
+        return outcome
 
-    tiles = await asyncio.gather(*(run(tile) for tile in plan.tiles))
+    fresh = dict(zip((tile_label(t) for t in targets), await asyncio.gather(*(run(t) for t in targets))))
+    outcomes = {tile_label(t): fresh.get(tile_label(t)) or previous[tile_label(t)] for t in plan.tiles}
     await report(92, "正在拼接")
-    merged = await asyncio.to_thread(stitch, plan, tiles, cfg.seam_feather, ref_arr)
+    merged = await asyncio.to_thread(stitch, plan, [o.image for o in outcomes.values()], cfg.seam_feather, ref_arr)
     merged = await asyncio.to_thread(anchor_to_source, merged, to_array(src), cfg.color_correction)
     output = to_image(merged)
     if alpha is not None:
@@ -202,10 +272,14 @@ async def upscale(
         plan=plan,
         scale=used_scale,
         scale_reduced=reduced,
-        failed_tiles=sorted(failed),
-        unaligned_tiles=sorted(unaligned),
-        patched_tiles=dict(sorted(patched.items())),
+        tiles=outcomes,
+        redrawn=sorted(fresh),
     )
+
+
+def tiles_worth_retrying(result_tiles: Dict[str, TileOutcome]) -> List[str]:
+    """Tiles a retry without explicit labels redraws: the failed ones (no image, not aligned, or deviating too much)."""
+    return sorted(label for label, tile in result_tiles.items() if tile.status != REDRAWN)
 
 
 @dataclass

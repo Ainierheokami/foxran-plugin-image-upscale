@@ -253,3 +253,167 @@ def test_aligned_redraw_with_corrected_text_is_kept_as_drawn():
     ghost = np.abs(detail(out)[inner] - detail(model)[inner])
     assert ghost.mean() < 0.05 and ghost.max() < 3.0
     assert np.abs(out[inner] - model[inner]).mean() < 10.0
+
+
+# --- retrying single tiles ------------------------------------------------------------
+
+jobs_mod = sys.modules[f"{pkg.__name__}.backend.jobs"]
+tool_mod = sys.modules[f"{pkg.__name__}.backend.tool"]
+
+
+def _bad_at(label: str):
+    """A model that returns noise for one tile (so it cannot be aligned) and a clean redraw elsewhere."""
+    row, col = label.split("-")
+    good = _fake_model(5)
+    calls = []
+
+    async def redraw(prompt: str, data: bytes, size: str) -> bytes:
+        here = f"第 {row} 行第 {col} 列" in prompt
+        calls.append(here)
+        if here:
+            w, h = tiling.parse_size(size)
+            arr = np.random.default_rng(len(calls)).integers(0, 255, (h, w, 3), dtype=np.uint8)
+            buf = BytesIO()
+            Image.fromarray(arr).save(buf, format="PNG")
+            return buf.getvalue()
+        return await good(prompt, data, size)
+
+    redraw.calls = calls
+    return redraw
+
+
+def test_retry_redraws_only_the_named_tiles():
+    src = _poster()
+    cfg = UpscaleConfig(tile_sizes=["1024x1024"], retries=0)
+    first = asyncio.run(upscale_mod.upscale(src, scale=2.0, cfg=cfg, redraw=_bad_at("1-2")))
+    assert first.unaligned_tiles == ["1-2"]
+    assert upscale_mod.tiles_worth_retrying(first.tiles) == ["1-2"]
+
+    calls = []
+
+    async def fixed(prompt, data, size):
+        calls.append(prompt)
+        return await _fake_model(7)(prompt, data, size)
+
+    again = asyncio.run(upscale_mod.upscale(
+        src, scale=first.scale, cfg=cfg, redraw=fixed,
+        plan=first.plan, previous=first.tiles, only=["1-2"],
+    ))
+    assert len(calls) == 1 and "第 1 行第 2 列" in calls[0]
+    # It failed last time, so the prompt says so from the first attempt.
+    assert upscale_mod.RETRY_PROMPT in calls[0]
+    assert again.redrawn == ["1-2"] and not again.unaligned_tiles
+    for label, tile in first.tiles.items():
+        if label != "1-2":
+            assert again.tiles[label] is tile
+
+
+def test_jobs_are_found_only_by_id_or_exact_output(tmp_path):
+    src = _poster(500, 400)
+    cfg = UpscaleConfig(tile_sizes=["1024x1024"], retries=0)
+    result = asyncio.run(upscale_mod.upscale(src, scale=2.0, cfg=cfg, redraw=_fake_model(2)))
+    out = tmp_path / "out.png"
+    result.image.save(out)
+    root = tmp_path / "jobs"
+    a = jobs_mod.save_job(root, source=src, result=result, output=out, text_hint="hi", session_id="s1")
+    b = jobs_mod.save_job(root, source=src, result=result, output=tmp_path / "other.png", text_hint="", session_id="s1")
+
+    assert jobs_mod.find_job(root, job_id=a.id).id == a.id
+    assert jobs_mod.find_job(root, job_id=a.id.upper()).id == a.id
+    assert jobs_mod.find_job(root, path=str(out)).id == a.id
+    # Without an id or file: only the newest run of the same chat, never another chat's.
+    assert jobs_mod.find_job(root) is None
+    assert jobs_mod.find_job(root, session_id="s1").id == b.id
+    assert jobs_mod.find_job(root, session_id="s2") is None
+    assert jobs_mod.find_job(root, job_id="ffffff" if "ffffff" not in {a.id, b.id} else "eeeeee") is None
+    assert jobs_mod.find_job(root, job_id="../etc", session_id="s1") is None
+
+    loaded = jobs_mod.find_job(root, job_id=a.id)
+    assert loaded.text_hint == "hi" and loaded.plan == result.plan and loaded.source().size == src.size
+    tiles = loaded.tiles()
+    assert set(tiles) == set(result.tiles)
+    for label in tiles:
+        # Tiles are stored as 8-bit PNG: only rounding differs.
+        assert np.abs(tiles[label].image - result.tiles[label].image).mean() < 1.0
+
+    assert jobs_mod.split_retry_text("3FA9C1 2-3，1-1") == ("3fa9c1", "2-3,1-1")
+    assert jobs_mod.split_retry_text("2-3 3fa9c1") == ("3fa9c1", "2-3")
+    assert jobs_mod.split_retry_text("2-3") == ("", "2-3")
+    assert jobs_mod.parse_labels("1-1,1_1", result.plan) == ["1-1"]
+    with pytest.raises(ValueError):
+        jobs_mod.parse_labels("9-9", result.plan)
+
+
+def test_tool_retry_by_id_or_latest_of_the_chat(tmp_path, monkeypatch):
+    src = _poster()
+    monkeypatch.setattr(tool_mod, "JOBS_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(tool_mod, "OUTPUT_DIR", tmp_path / "out")
+    monkeypatch.setattr(tool_mod, "load_config", lambda: UpscaleConfig(tile_sizes=["1024x1024"], retries=0))
+
+    async def load(_raw, _ctx):
+        return src.copy()
+
+    monkeypatch.setattr(tool_mod, "_load_input", load)
+    model = {"redraw": _bad_at("1-2")}
+    monkeypatch.setattr(tool_mod, "_make_redraw", lambda _cfg: lambda *a: model["redraw"](*a))
+    tool = tool_mod.ImageHDUpscaleTool()
+    ctx = type("Ctx", (), {"session_id": "s1"})()
+
+    first = asyncio.run(tool.execute(path="x.png", session_ctx=ctx))
+    assert first.success, first.error
+    match = __import__("re").search(r"任务号 ([0-9a-f]{6})", first.data)
+    assert match and "1-2" in first.data
+    job_id = match.group(1)
+
+    # A bare retry in another chat finds nothing; an unknown id is reported as such.
+    other = asyncio.run(tool.execute(retry_tiles="auto", session_ctx=type("Ctx", (), {"session_id": "s2"})()))
+    assert not other.success and "还没有放大记录" in other.error
+    unknown = asyncio.run(tool.execute(retry_tiles="abcdef 1-2" if job_id != "abcdef" else "abcdee 1-2", session_ctx=ctx))
+    assert not unknown.success and "找不到任务号" in unknown.error
+
+    calls = []
+
+    async def fixed(prompt, data, size):
+        calls.append(prompt)
+        return await _fake_model(9)(prompt, data, size)
+
+    model["redraw"] = fixed
+    retried = asyncio.run(tool.execute(retry_tiles=f"{job_id}", session_ctx=ctx))
+    assert retried.success, retried.error
+    assert len(calls) == 1 and "重绘了第 1-2 块" in retried.data
+    assert jobs_mod.find_job(tmp_path / "jobs", job_id=job_id).statuses["1-2"]["status"] == "redrawn"
+    # "/放大 重试 <id> <块>" goes the same way; a named tile is redrawn even when it was fine.
+    named = asyncio.run(tool.execute(text_hint=f"重试 {job_id} 1-1", session_ctx=ctx))
+    assert named.success and len(calls) == 2 and "第 1 行第 1 列" in calls[-1]
+    assert f"任务 {job_id}" in named.data
+
+    # A newer upscale in the chat: a bare retry takes it and redraws its failed tiles.
+    model["redraw"] = _bad_at("1-1")
+    second = asyncio.run(tool.execute(path="y.png", session_ctx=ctx))
+    second_id = __import__("re").search(r"任务号 ([0-9a-f]{6})", second.data).group(1)
+    model["redraw"] = fixed
+    bare = asyncio.run(tool.execute(retry_tiles="auto", session_ctx=ctx))
+    assert bare.success and f"任务 {second_id}" in bare.data and "第 1 行第 1 列" in calls[-1] and len(calls) == 3
+    # Tiles only, no id: the newest run as well.
+    tiles_only = asyncio.run(tool.execute(retry_tiles="1-2", session_ctx=ctx))
+    assert tiles_only.success and f"任务 {second_id}" in tiles_only.data and "第 1 行第 2 列" in calls[-1]
+    nothing_failed = asyncio.run(tool.execute(retry_tiles="auto", session_ctx=ctx))
+    assert not nothing_failed.success and "没有失败的块" in nothing_failed.error
+    # Records stay (keep_jobs defaults to 0 = keep forever).
+    assert len(jobs_mod.list_jobs(tmp_path / "jobs")) == 2
+
+
+def test_automatic_retry_uses_the_stronger_prompt():
+    model = _bad_at("1-1")
+    prompts = []
+
+    async def recording(prompt, data, size):
+        prompts.append(prompt)
+        return await model(prompt, data, size)
+
+    cfg = UpscaleConfig(tile_sizes=["1024x1024"], retries=1)
+    asyncio.run(upscale_mod.upscale(_poster(), scale=2.0, cfg=cfg, redraw=recording))
+    bad = [p for p in prompts if "第 1 行第 1 列" in p]
+    assert len(bad) == 2
+    assert upscale_mod.RETRY_PROMPT not in bad[0] and upscale_mod.RETRY_PROMPT in bad[1]
+    assert all(upscale_mod.RETRY_PROMPT not in p for p in prompts if "第 1 行第 1 列" not in p)
