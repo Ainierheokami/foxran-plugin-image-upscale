@@ -55,9 +55,9 @@
           <div class="ihu-chips">
             <span v-for="(size, i) in cfg.tile_sizes" :key="size + i" class="ihu-chip">
               {{ size }}
-              <button type="button" title="移除" :disabled="cfg.tile_sizes.length <= 1" @click="removeSize(i)"><X class="ihu-chip-x" /></button>
+              <button type="button" title="移除" :disabled="cfg.tile_sizes.length <= 1" @click="removeSize('tile_sizes', i)"><X class="ihu-chip-x" /></button>
             </span>
-            <input v-model="newSize" class="ihu-chip-input" placeholder="宽x高，回车添加" @keydown.enter.prevent="addSize" />
+            <input v-model="newSize.tile_sizes" class="ihu-chip-input" placeholder="宽x高，回车添加" @keydown.enter.prevent="addSize('tile_sizes')" />
           </div>
           <small>{{ desc('tile_sizes') }} GPT Image 2 支持 1024x1024、1536x1024、1024x1536 等。</small>
         </div>
@@ -78,7 +78,25 @@
         <label class="ihu-switch"><span><b>失败时用插值顶上</b><small>{{ desc('fallback_on_failure') }}</small></span><input v-model="cfg.fallback_on_failure" type="checkbox" @change="touch" /></label>
       </AdapterFormSection>
 
-      <AdapterFormSection index="04" title="输出与记录" description="结果图的格式，以及供 /放大重试 使用的放大记录。" :icon="HardDrive">
+      <AdapterFormSection index="04" title="局部换切法重绘" description="切线正好切开了字、某块失败或变形时，只在那一小片换一种切法重新切块重绘，不重切整张图。" :icon="Scissors">
+        <label class="ihu-switch ihu-wide"><span><b>局部换切法重绘</b><small>{{ desc('refine') }}</small></span><input v-model="cfg.refine" type="checkbox" @change="touch" /></label>
+        <div class="ihu-field ihu-wide">
+          <span>局部切块尺寸</span>
+          <div class="ihu-chips">
+            <span v-for="(size, i) in cfg.refine_tile_sizes" :key="size + i" class="ihu-chip">
+              {{ size }}
+              <button type="button" title="移除" :disabled="!cfg.refine || cfg.refine_tile_sizes.length <= 1" @click="removeSize('refine_tile_sizes', i)"><X class="ihu-chip-x" /></button>
+            </span>
+            <input v-model="newSize.refine_tile_sizes" class="ihu-chip-input" placeholder="宽x高，回车添加" :disabled="!cfg.refine" @keydown.enter.prevent="addSize('refine_tile_sizes')" />
+          </div>
+          <small>{{ desc('refine_tile_sizes') }}</small>
+        </div>
+        <label><span>局部切块冗余比例</span><input v-model.number="cfg.refine_overlap_ratio" type="number" step="0.01" min="0.02" max="0.45" :disabled="!cfg.refine" @input="touch" /><small>{{ desc('refine_overlap_ratio') }}</small></label>
+        <label><span>上下文边距（像素）</span><input v-model.number="cfg.refine_margin" type="number" step="8" min="0" max="512" :disabled="!cfg.refine" @input="touch" /><small>{{ desc('refine_margin') }}</small></label>
+        <label><span>最多局部重绘块数</span><input v-model.number="cfg.refine_max_tiles" type="number" min="0" max="64" :disabled="!cfg.refine" @input="touch" /><small>{{ desc('refine_max_tiles') }}</small></label>
+      </AdapterFormSection>
+
+      <AdapterFormSection index="05" title="输出与记录" description="结果图的格式，以及供 /放大重试 使用的放大记录。" :icon="HardDrive">
         <label>
           <span>输出格式</span>
           <select v-model="cfg.output_format" @change="touch"><option value="png">PNG</option><option value="jpg">JPG</option><option value="webp">WebP</option></select>
@@ -100,12 +118,13 @@
 
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { Bot, Grid3x3, HardDrive, ImageUpscale, Loader2, RefreshCw, RotateCcw, Save, Wrench, X } from 'lucide-vue-next'
+import { Bot, Grid3x3, HardDrive, ImageUpscale, Loader2, RefreshCw, RotateCcw, Save, Scissors, Wrench, X } from 'lucide-vue-next'
 import { AdapterFormSection, host } from '../host'
 
 defineProps<{ currentFile?: string }>()
 
-type Config = Record<string, any> & { tile_sizes: string[] }
+type SizeList = 'tile_sizes' | 'refine_tile_sizes'
+type Config = Record<string, any> & Record<SizeList, string[]>
 type Model = { name: string; tags: string[]; available: boolean }
 type Payload = { config: Config; defaults: Config; descriptions: Record<string, string> }
 
@@ -118,7 +137,7 @@ const busy = ref(false)
 const dirty = ref(false)
 const error = ref('')
 const message = ref('')
-const newSize = ref('')
+const newSize = ref<Record<SizeList, string>>({ tile_sizes: '', refine_tile_sizes: '' })
 
 const editModels = computed(() => models.value.filter((m) => m.tags.includes('image_edit')))
 const visionModels = computed(() => models.value.filter((m) => m.tags.includes('vision')))
@@ -143,21 +162,21 @@ function setMegapixels(value: number) {
   touch()
 }
 
-function addSize() {
+function addSize(key: SizeList) {
   if (!cfg.value) return
-  const text = newSize.value.trim().toLowerCase().replace(/[×*\s]/g, 'x')
+  const text = newSize.value[key].trim().toLowerCase().replace(/[×*\s]/g, 'x')
   const match = /^(\d{3,4})x(\d{3,4})$/.exec(text)
   if (!match) { error.value = '切块尺寸应写成 宽x高，如 1536x1024'; return }
   const size = `${Number(match[1])}x${Number(match[2])}`
-  if (!cfg.value.tile_sizes.includes(size)) cfg.value.tile_sizes.push(size)
-  newSize.value = ''
+  if (!cfg.value[key].includes(size)) cfg.value[key].push(size)
+  newSize.value[key] = ''
   error.value = ''
   touch()
 }
 
-function removeSize(index: number) {
-  if (!cfg.value || cfg.value.tile_sizes.length <= 1) return
-  cfg.value.tile_sizes.splice(index, 1)
+function removeSize(key: SizeList, index: number) {
+  if (!cfg.value || cfg.value[key].length <= 1) return
+  cfg.value[key].splice(index, 1)
   touch()
 }
 

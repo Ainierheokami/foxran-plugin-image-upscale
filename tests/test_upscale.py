@@ -130,10 +130,17 @@ def test_failed_tile_falls_back_to_interpolation():
         calls["n"] += 1
         raise RuntimeError("boom")
 
-    cfg = UpscaleConfig(tile_sizes=["1024x1024"], retries=1)
+    cfg = UpscaleConfig(tile_sizes=["1024x1024"], retries=1, refine=False)
     result = asyncio.run(upscale_mod.upscale(_poster(), scale=2.0, cfg=cfg, redraw=flaky))
     assert len(result.failed_tiles) == len(result.plan.tiles)
     assert calls["n"] == 2 * len(result.plan.tiles)
+
+    # With the local recut on, its pieces fail too; the first pass stays and the summary says so.
+    calls["n"] = 0
+    recut = asyncio.run(upscale_mod.upscale(_poster(), scale=2.0, cfg=cfg.model_copy(update={"refine": True}), redraw=flaky))
+    assert recut.refine_failed > 0 and not recut.patches
+    assert calls["n"] == 2 * (len(recut.plan.tiles) + recut.refine_failed)
+    assert "局部重绘失败" in tool_mod.describe(recut, (900, 640), 1.0)
 
     cfg_strict = cfg.model_copy(update={"fallback_on_failure": False})
     with pytest.raises(RuntimeError):
@@ -284,7 +291,7 @@ def _bad_at(label: str):
 
 def test_retry_redraws_only_the_named_tiles():
     src = _poster()
-    cfg = UpscaleConfig(tile_sizes=["1024x1024"], retries=0)
+    cfg = UpscaleConfig(tile_sizes=["1024x1024"], retries=0, refine=False)
     first = asyncio.run(upscale_mod.upscale(src, scale=2.0, cfg=cfg, redraw=_bad_at("1-2")))
     assert first.unaligned_tiles == ["1-2"]
     assert upscale_mod.tiles_worth_retrying(first.tiles) == ["1-2"]
@@ -348,7 +355,7 @@ def test_tool_retry_by_id_or_latest_of_the_chat(tmp_path, monkeypatch):
     src = _poster()
     monkeypatch.setattr(tool_mod, "JOBS_DIR", tmp_path / "jobs")
     monkeypatch.setattr(tool_mod, "OUTPUT_DIR", tmp_path / "out")
-    monkeypatch.setattr(tool_mod, "load_config", lambda: UpscaleConfig(tile_sizes=["1024x1024"], retries=0))
+    monkeypatch.setattr(tool_mod, "load_config", lambda: UpscaleConfig(tile_sizes=["1024x1024"], retries=0, refine=False))
 
     async def load(_raw, _ctx):
         return src.copy()
@@ -417,7 +424,7 @@ def test_automatic_retry_uses_the_stronger_prompt():
         prompts.append(prompt)
         return await model(prompt, data, size)
 
-    cfg = UpscaleConfig(tile_sizes=["1024x1024"], retries=1)
+    cfg = UpscaleConfig(tile_sizes=["1024x1024"], retries=1, refine=False)
     asyncio.run(upscale_mod.upscale(_poster(), scale=2.0, cfg=cfg, redraw=recording))
     bad = [p for p in prompts if "第 1 行第 1 列" in p]
     assert len(bad) == 2
@@ -520,7 +527,158 @@ def test_settings_api_validates_and_keeps_comments(tmp_path, monkeypatch):
         (dict(cfg, default_scale=5, max_scale=4), "default_scale"),
         (dict(cfg, output_format="gif"), "output_format"),
         (dict(cfg, mystery=1), "mystery"),
+        (dict(cfg, refine_tile_sizes=["128x128"]), "128x128"),
+        (dict(cfg, refine_max_tiles=100), "refine_max_tiles"),
     ]:
         rejected = client.post("/api/v1/plugins/image-hd-upscale/config", json={"config": bad})
         assert rejected.status_code == 400 and word in rejected.json()["detail"]
     assert "retries: 2" in path.read_text(encoding="utf-8")
+
+
+# ------------------------------------------------------------ local recut
+
+refine_mod = sys.modules[f"{pkg.__name__}.backend.refine"]
+EDGE = 0.12  # share of the request width the grid model garbles at a tile's left and right edges
+
+
+def _sharpen(arr: np.ndarray) -> np.ndarray:
+    return np.clip(arr * 1.6 - cv2.GaussianBlur(arr, (0, 0), 2.0) * 0.6, 0, 255)
+
+
+def _png_bytes(arr: np.ndarray) -> bytes:
+    buf = BytesIO()
+    Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _edge_garbling_model():
+    """Sharpens everything; on grid tiles it also redraws the content near the left and right
+    edges wrongly (mirrored), the way a cut line through text leaves both neighbours wrong.
+    Pieces recut around such a place (their prompt names a range of the whole image) come out clean."""
+    prompts = []
+
+    async def redraw(prompt: str, data: bytes, size: str) -> bytes:
+        prompts.append(prompt)
+        with Image.open(BytesIO(data)) as im:
+            arr = _sharpen(np.asarray(im.convert("RGB"), np.float32))
+        if "整图横向" not in prompt:
+            band = int(arr.shape[1] * EDGE)
+            arr[:, :band] = arr[::-1, :band]
+            arr[:, -band:] = arr[::-1, -band:]
+        return _png_bytes(arr)
+
+    redraw.prompts = prompts
+    return redraw
+
+
+def test_boxes_merge_and_cuts_move_onto_quiet_lines():
+    assert refine_mod.merge_boxes([(0, 0, 10, 10), (15, 0, 30, 10), (100, 100, 110, 110)], gap=8) == [
+        (0, 0, 30, 10), (100, 100, 110, 110),
+    ]
+    # A text column at x 40..60 on a flat page: an edge at x=50 moves off it onto flat ground.
+    page = np.full((200, 200, 3), 240, np.float32)
+    page[20:180:6, 40:60] = 0
+    energy = refine_mod.edge_energy(page)
+    x0, y0, x1, y1 = refine_mod.snap_to_quiet((50, 0, 150, 200), energy, search=32, band=6)
+    assert x0 + 6 < 40 and energy[:, x0:x0 + 6].mean() < 1.0
+    # The other edges were on flat ground or the border already.
+    assert (y0, y1) == (0, 200) and energy[:, x1 - 6:x1].mean() < 1.0
+    # A small area gets one piece centred on it, with context; a big one its own grid.
+    sizes = ["768x768", "1024x768", "768x1024"]
+    (piece,) = refine_mod.plan_pieces((900, 500, 1000, 540), 1800, 1280, sizes, 0.3, 64)
+    assert piece[2] - piece[0] >= 768 and piece[3] - piece[1] >= 768
+    assert piece[0] < 900 and piece[2] > 1000 and piece[1] < 500 and piece[3] > 540
+    grid = refine_mod.plan_pieces((0, 0, 1800, 1280), 1800, 1280, sizes, 0.3, 64)
+    assert len(grid) > 1
+    covered = np.zeros((1280, 1800), bool)
+    for bx0, by0, bx1, by1 in grid:
+        covered[by0:by1, bx0:bx1] = True
+    assert covered.all()
+
+
+def _edge_error(result, src, plan) -> float:
+    """Distance from the sharpened reference inside the garbled bands of the grid tiles."""
+    ref = _sharpen(np.asarray(src.resize(result.image.size, Image.LANCZOS), np.float32))
+    out = np.asarray(result.image, np.float32)
+    mask = np.zeros(out.shape[:2], bool)
+    for t in plan.tiles:
+        band = int(t.w * EDGE)
+        mask[t.y:t.y + t.h, t.x:t.x + band] = True
+        mask[t.y:t.y + t.h, t.x + t.w - band:t.x + t.w] = True
+    return float(np.abs(out - ref).mean(axis=2)[mask].mean())
+
+
+def test_areas_cut_by_the_grid_are_recut_locally():
+    src = _poster()
+    base = UpscaleConfig(tile_sizes=["1024x1024"], retries=0, refine_max_tiles=16)
+    plain = asyncio.run(upscale_mod.upscale(
+        src, scale=2.0, cfg=base.model_copy(update={"refine": False}), redraw=_edge_garbling_model(),
+    ))
+    assert plain.patched_tiles and not plain.patches
+
+    model = _edge_garbling_model()
+    result = asyncio.run(upscale_mod.upscale(src, scale=2.0, cfg=base, redraw=model))
+    pieces = [p for p in model.prompts if "整图横向" in p]
+    assert result.patches and len(pieces) <= 16
+    # The recut pieces are told the area failed before.
+    assert all(upscale_mod.RETRY_PROMPT in p for p in pieces)
+    plan = result.plan
+    seams = {t.x for t in plan.tiles if t.x} | {t.x + t.w for t in plan.tiles if t.x + t.w < plan.out_w}
+    # Pieces are cut elsewhere: each one spans a first-pass cut line instead of ending on it.
+    assert any(p.box[0] < x < p.box[2] for p in result.patches for x in seams)
+    # Where the first pass fell back to the blurry original, the sharp redraw now shows.
+    assert _edge_error(result, src, plan) < 0.7 * _edge_error(plain, src, plan)
+    # And the rest of the image did not get worse.
+    ref = np.asarray(src.resize(result.image.size, Image.LANCZOS), np.float32)
+    assert np.abs(np.asarray(result.image, np.float32) - ref).mean() < np.abs(np.asarray(plain.image, np.float32) - ref).mean() + 1.0
+    assert _seam_jump(np.asarray(result.image, np.float32), plan) < 2.0
+
+
+def test_recut_budget_and_switch():
+    src = _poster()
+    cfg = UpscaleConfig(tile_sizes=["1024x1024"], retries=0, refine_max_tiles=1)
+    model = _edge_garbling_model()
+    result = asyncio.run(upscale_mod.upscale(src, scale=2.0, cfg=cfg, redraw=model))
+    assert sum("整图横向" in p for p in model.prompts) <= 1
+    assert result.refine_skipped > 0
+    assert "局部重绘上限" in tool_mod.describe(result, src.size, 1.0)
+
+    off = _edge_garbling_model()
+    asyncio.run(upscale_mod.upscale(src, scale=2.0, cfg=cfg.model_copy(update={"refine": False}), redraw=off))
+    assert not any("整图横向" in p for p in off.prompts)
+
+
+def test_recut_pieces_survive_a_retry_of_other_tiles(tmp_path):
+    src = _poster()
+    cfg = UpscaleConfig(tile_sizes=["1024x1024"], retries=0, refine_max_tiles=16)
+    first = asyncio.run(upscale_mod.upscale(src, scale=2.0, cfg=cfg, redraw=_edge_garbling_model()))
+    out = tmp_path / "out.png"
+    first.image.save(out)
+    job = jobs_mod.save_job(tmp_path / "jobs", source=src, result=first, output=out, text_hint="", session_id="s")
+    loaded = jobs_mod.find_job(tmp_path / "jobs", job_id=job.id)
+    patches = loaded.patches()
+    assert [p.box for p in patches] == [p.box for p in first.patches]
+    assert all(np.abs(a.alpha - b.alpha).max() < 0.01 for a, b in zip(patches, first.patches))
+    tiles = loaded.tiles()
+    assert any(t.regions for t in tiles.values())
+
+    # Redraw a tile that some recut piece does not touch.
+    for tile in first.plan.tiles:
+        rect = (tile.x, tile.y, tile.x + tile.w, tile.y + tile.h)
+        away = [p for p in patches if not refine_mod.intersect(p.box, rect)]
+        if away:
+            break
+    assert away, "the test needs a recut piece away from some tile"
+    label = upscale_mod.tile_label(tile)
+    model = _edge_garbling_model()
+    again = asyncio.run(upscale_mod.upscale(
+        loaded.source(), scale=loaded.scale, cfg=cfg, redraw=model,
+        plan=loaded.plan, previous=tiles, only=[label], previous_patches=patches,
+    ))
+    assert again.redrawn == [label]
+    # Pieces away from the redrawn tile come back as they were; only areas touching it are recut.
+    kept = [p for p in again.patches if any(p is q for q in away)]
+    assert len(kept) == len(away)
+    assert all(refine_mod.intersect(p.box, rect) for p in again.patches if not any(p is q for q in away))
+    grid_calls = [p for p in model.prompts if "整图横向" not in p]
+    assert len(grid_calls) == 1

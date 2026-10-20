@@ -169,6 +169,18 @@ def describe(
     if heavy:
         parts = "，".join(f"{k}（{v:.0%}）" for k, v in heavy.items())
         lines.append(f"模型重绘时挪动或改动了部分内容，这些区域已用原图插值填补：{parts}。")
+    if result.patches:
+        lines.append(
+            f"另外对切线附近画得不一致、重绘失败或被插值填补的地方，在局部换了一种切法重新切块重绘，用上了 {len(result.patches)} 块"
+            "（重绘对上原图的部分已替换上面说的插值）。"
+        )
+    if result.refine_failed or result.refine_skipped:
+        left = []
+        if result.refine_failed:
+            left.append(f"{result.refine_failed} 块局部重绘失败")
+        if result.refine_skipped:
+            left.append(f"{result.refine_skipped} 处误差区域超出局部重绘上限（refine_max_tiles）")
+        lines.append(f"{'，'.join(left)}，这些地方保持第一轮的结果。")
     if job_id:
         retryable = tiles_worth_retrying(result.tiles)
         if retryable:
@@ -328,6 +340,7 @@ class ImageHDUpscaleTool(BaseTool):
                 previous=previous,
                 only=only,
                 fixes=fixes,
+                previous_patches=job.patches() if job else (),
             )
         except Exception as e:
             logger.error(f"[图片放大] 处理失败: {e}", exc_info=True)

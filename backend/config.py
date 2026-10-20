@@ -37,6 +37,18 @@ class UpscaleConfig(BaseModel):
     max_deviation: float = Field(0.08, description="一块里偏差区域占比超过多少就重绘一次（受 retries 限制）；偏差区域最终用原图插值填补。")
     color_correction: float = Field(0.8, description="校色强度 0~1：各块低频校色，拼好后再按原图整体校正；0 关闭。")
     seam_feather: float = Field(6.0, description="拼缝羽化半径（像素）。")
+    refine: bool = Field(
+        True,
+        description="第一轮拼好后，对失败、对不齐、用原图插值填补过的区域，以及相邻两块在冗余区画得不一致的地方"
+        "（多半是切线正好切开了字），在这块局部换一种切法重新切块重绘再拼回；每块一次模型调用。",
+    )
+    refine_tile_sizes: List[str] = Field(
+        default_factory=lambda: ["768x768", "1024x768", "768x1024"],
+        description="局部重绘的切块尺寸（输出像素）。误差区域放得进一块就切一块以它为中心的，放不下再按这些尺寸另切网格。",
+    )
+    refine_overlap_ratio: float = Field(0.3, description="误差区域较大、要切成多块时，这些块之间的冗余比例。")
+    refine_margin: int = Field(64, description="误差区域向外留的上下文（像素）；切口会在这个范围内挪到原图里最空的行列上，避免又切到字。")
+    refine_max_tiles: int = Field(8, description="一次放大里局部重绘最多调用几次模型；超出时优先补大的误差区域。")
     fallback_on_failure: bool = Field(True, description="某块重试仍失败时用普通插值顶上，而不是整张失败。")
     proofread: bool = Field(True, description="放大前先让视觉模型通读整张图，按上下文找出错别字和乱码，把修正写进每块的提示词。")
     proofread_model: str = Field("", description="校对用的视觉模型名（models.yaml）；留空按 vision 标签选。")

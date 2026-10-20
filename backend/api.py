@@ -35,6 +35,9 @@ RANGES: Dict[str, tuple] = {
     "max_deviation": (0.0, 1.0),
     "color_correction": (0.0, 1.0),
     "seam_feather": (0.0, 64.0),
+    "refine_overlap_ratio": (0.02, 0.45),
+    "refine_margin": (0, 512),
+    "refine_max_tiles": (0, 64),
     "jpeg_quality": (50, 100),
     "max_output_mb": (0.0, 500.0),
     "keep_jobs": (0, 100_000),
@@ -65,7 +68,9 @@ def validate(raw: Dict[str, Any]) -> UpscaleConfig:
         problems.append("default_scale 不能大于 max_scale")
     if not cfg.tile_sizes:
         problems.append("tile_sizes 至少要有一种切块尺寸")
-    for size in cfg.tile_sizes:
+    if not cfg.refine_tile_sizes:
+        problems.append("refine_tile_sizes 至少要有一种切块尺寸")
+    for size in [*cfg.tile_sizes, *cfg.refine_tile_sizes]:
         try:
             w, h = parse_size(size)
         except Exception:

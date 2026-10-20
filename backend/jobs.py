@@ -24,6 +24,9 @@ from PIL import Image
 
 from app.logger import setup_logger
 
+import numpy as np
+
+from .refine import Patch
 from .tiling import Tile, TilePlan, to_array, to_image
 from .upscale import TileOutcome, UpscaleResult
 
@@ -46,6 +49,7 @@ class Job:
     session_id: str = ""
     outputs: List[str] = field(default_factory=list)
     statuses: Dict[str, dict] = field(default_factory=dict)
+    patch_info: List[dict] = field(default_factory=list)
     updated: float = 0.0
 
     def source(self) -> Image.Image:
@@ -58,8 +62,27 @@ class Job:
         for label, info in self.statuses.items():
             with Image.open(self.directory / "tiles" / f"{label}.png") as img:
                 array = to_array(img.convert("RGB"))
-            outcomes[label] = TileOutcome(image=array, status=info["status"], patched=float(info.get("patched", 0.0)))
+            outcomes[label] = TileOutcome(
+                image=array, status=info["status"], patched=float(info.get("patched", 0.0)),
+                regions=[tuple(int(v) for v in box) for box in info.get("regions", []) if len(box) == 4],
+            )
         return outcomes
+
+    def patches(self) -> List[Patch]:
+        """The locally recut pieces of the last run, as they were blended in."""
+        patches = []
+        for info in self.patch_info:
+            try:
+                with Image.open(self.directory / "patches" / info["file"]) as img:
+                    rgba = np.asarray(img.convert("RGBA"), np.float32)
+            except Exception as e:
+                logger.debug(f"[图片放大] 读取局部重绘结果 {info.get('file')} 失败: {e}")
+                continue
+            patches.append(Patch(
+                box=tuple(int(v) for v in info["box"]), error=tuple(int(v) for v in info["error"]),
+                image=rgba[..., :3], alpha=rgba[..., 3] / 255.0,
+            ))
+        return patches
 
 
 def _plan_to_dict(plan: TilePlan) -> dict:
@@ -103,9 +126,19 @@ def save_job(
         tile = result.tiles[label]
         to_image(tile.image).save(job.directory / "tiles" / f"{label}.png")
     job.statuses = {
-        label: {"status": t.status, "patched": round(t.patched, 4)}
+        label: {"status": t.status, "patched": round(t.patched, 4), "regions": [list(b) for b in t.regions]}
         for label, t in result.tiles.items()
     }
+    patch_dir = job.directory / "patches"
+    shutil.rmtree(patch_dir, ignore_errors=True)
+    job.patch_info = []
+    if result.patches:
+        patch_dir.mkdir(parents=True, exist_ok=True)
+    for index, patch in enumerate(result.patches):
+        name = f"{index + 1}.png"
+        rgba = np.dstack([np.clip(np.rint(patch.image), 0, 255), np.clip(np.rint(patch.alpha * 255), 0, 255)])
+        Image.fromarray(rgba.astype(np.uint8), "RGBA").save(patch_dir / name)
+        job.patch_info.append({"box": list(patch.box), "error": list(patch.error), "file": name})
     job.updated = time.time()
     meta = {
         "version": VERSION,
@@ -116,6 +149,7 @@ def save_job(
         "outputs": job.outputs,
         "plan": _plan_to_dict(job.plan),
         "tiles": job.statuses,
+        "patches": job.patch_info,
         "updated": job.updated,
     }
     (job.directory / META).write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -139,6 +173,7 @@ def _load(directory: Path) -> Optional[Job]:
             session_id=meta.get("session_id", ""),
             outputs=list(meta.get("outputs", [])),
             statuses=dict(meta.get("tiles", {})),
+            patch_info=list(meta.get("patches", [])),
             updated=float(meta.get("updated", 0.0)),
         )
     except Exception as e:
