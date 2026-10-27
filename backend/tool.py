@@ -108,13 +108,17 @@ def _resolve_input_path(raw: str, session_ctx: Any) -> str:
     return text
 
 
+def _decode(path: str) -> Image.Image:
+    with Image.open(path) as img:
+        img.load()
+        return img.copy()
+
+
 async def _load_input(raw: str, session_ctx: Any) -> Image.Image:
     from app.tools.plugins.core_tools.image_tools.utils import path2img
 
     async with path2img(_resolve_input_path(raw, session_ctx)) as local_path:
-        with Image.open(local_path) as img:
-            img.load()
-            return img.copy()
+        return await asyncio.to_thread(_decode, local_path)
 
 
 def save_output(image: Image.Image, cfg: UpscaleConfig) -> Path:
@@ -351,7 +355,8 @@ class ImageHDUpscaleTool(BaseTool):
         if job is not None and set(result.redrawn) <= set(result.failed_tiles):
             return ToolResult(tool_name=self.name, success=False, error=f"第 {', '.join(result.redrawn)} 块重绘仍然失败，请检查图像编辑模型配置。")
 
-        path = save_output(result.image, cfg)
+        # 大图 PNG optimize 要压十几秒，放在事件循环里会卡住所有页面
+        path = await asyncio.to_thread(save_output, result.image, cfg)
         saved = None
         try:
             saved = await asyncio.to_thread(

@@ -8,6 +8,7 @@ in context and lists the corrections; every tile prompt then names them.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import re
@@ -77,11 +78,12 @@ async def proofread(image: Image.Image, ask: Ask, user_hint: str = "") -> Proofr
     prompt = PROMPT
     if user_hint:
         prompt += f"\n用户给出的正确文字如下，以它为准：{user_hint}"
+    data_url = await asyncio.to_thread(_data_url, image)
     messages = [
         {"role": "system", "content": SYSTEM},
         {"role": "user", "content": [
             {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": _data_url(image)}},
+            {"type": "image_url", "image_url": {"url": data_url}},
         ]},
     ]
     return parse_reply(await ask(messages))

@@ -188,6 +188,14 @@ def choose_scale(src_w: int, src_h: int, requested: float, cfg: UpscaleConfig) -
         scale, reduced = max(1.0, round(scale - 0.25, 2)), True
 
 
+def _finish(merged: np.ndarray, alpha: Optional[Image.Image]) -> Image.Image:
+    output = to_image(merged)
+    if alpha is not None:
+        output = output.convert("RGBA")
+        output.putalpha(alpha.resize(output.size, Image.LANCZOS))
+    return output
+
+
 def _png(image: Image.Image) -> bytes:
     buffer = BytesIO()
     image.save(buffer, format="PNG")
@@ -233,8 +241,8 @@ async def upscale(
         used_scale, reduced = scale, False
         if (plan.src_w, plan.src_h) != src.size:
             raise ValueError("原图尺寸和切块方案不一致")
-    reference = src.resize((plan.out_w, plan.out_h), Image.LANCZOS)
-    ref_arr = to_array(reference)
+    reference = await asyncio.to_thread(src.resize, (plan.out_w, plan.out_h), Image.LANCZOS)
+    ref_arr = await asyncio.to_thread(to_array, reference)
     previous = previous or {}
     targets = [
         tile for tile in plan.tiles
@@ -243,7 +251,7 @@ async def upscale(
     total = len(targets)
     if debug_dir is not None:
         debug_dir.mkdir(parents=True, exist_ok=True)
-        reference.save(debug_dir / "reference.png")
+        await asyncio.to_thread(reference.save, debug_dir / "reference.png")
     if total == len(plan.tiles):
         await report(5, f"{src.width}x{src.height} → {plan.out_w}x{plan.out_h}，切成 {plan.rows}×{plan.cols} 块")
     else:
@@ -293,10 +301,7 @@ async def upscale(
 
     await report(96, "正在校色")
     merged = await asyncio.to_thread(anchor_to_source, merged, to_array(src), cfg.color_correction)
-    output = to_image(merged)
-    if alpha is not None:
-        output = output.convert("RGBA")
-        output.putalpha(alpha.resize(output.size, Image.LANCZOS))
+    output = await asyncio.to_thread(_finish, merged, alpha)
     return UpscaleResult(
         image=output,
         plan=plan,
