@@ -89,12 +89,22 @@ async def proofread(image: Image.Image, ask: Ask, user_hint: str = "") -> Proofr
     return parse_reply(await ask(messages))
 
 
+PROOFREAD_MAX_TOKENS = 16384
+
+
 def make_ask(model_name: str = "") -> Ask:
     async def ask(messages: list) -> str:
         from app.openai_client import ask_model
+        from app.openai_client.model_config import ModelOverrideParams
 
         name = model_name.strip()
-        return await ask_model(messages=messages, tags=["vision"], model_names=[name] if name else None)
+        # 思考模型逐字核对时思考常写到几千字，用聊天模型的输出上限会写完思考就被截断、一个字不出
+        return await ask_model(
+            messages=messages,
+            tags=["vision"],
+            model_names=[name] if name else None,
+            override=ModelOverrideParams(max_tokens=PROOFREAD_MAX_TOKENS),
+        )
 
     return ask
 
